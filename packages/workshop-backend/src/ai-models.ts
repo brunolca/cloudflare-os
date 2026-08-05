@@ -246,6 +246,24 @@ function workersAiCompat(catalog: CatalogEntry | undefined): OpenAICompletionsCo
   };
 }
 
+// Compat flags for Neuralwatt's OpenAI-compatible endpoint (vLLM-backed). pi auto-detects most of
+// these from the base URL and has no rule for api.neuralwatt.com, so it would otherwise apply
+// OpenAI's own conventions. Only `supportsDeveloperRole` is load-bearing: Neuralwatt hard-rejects
+// the `developer` role with HTTP 400 ("Use role 'system' instead"), and its /v1/models catalog
+// declares `developer_role: false` / `system_role: true` for every model. The other two suppress
+// request fields the endpoint silently ignores, so pi doesn't advertise caching it won't get.
+//
+// Deliberately left at pi's defaults: `reasoning_effort` is accepted by every model (the catalog
+// marks it unsupported on kimi-k2.7-code, which ignores it rather than failing), and tool-result
+// replay was verified to work with reasoning blocks, tool_calls, and no `name` field.
+function neuralwattCompat(): OpenAICompletionsCompat {
+  return {
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    supportsLongCacheRetention: false,
+  };
+}
+
 // Build the pi model descriptor for reaching a provider's own native API through an AI Gateway
 // (the platform's or a user's). `gatewayUrl` is a gateway root -- over HTTPS
 // (https://gateway.ai.cloudflare.com/v1/{accountId}/{gateway}) or, for binding-routed requests,
@@ -599,6 +617,22 @@ function signGeminiFunctionCalls(model: Model<Api>, payload: unknown): object | 
 export function getModel(env: Cloudflare.Env, config: AiModelConfig,
                          initiator: AiChatAuthorInfo,
                          options: ModelRoutingOptions = {}): ModelHandle {
+  // Neuralwatt is not a Cloudflare AI Gateway provider (it is absent from the Gateway's provider
+  // catalog), so neither gateway path below can carry it: it always talks straight to
+  // https://api.neuralwatt.com/v1. Checked before the BYOK branch too, because a user's own
+  // Gateway can't proxy it either -- meaning neuralwatt usage is always funded by the
+  // deployment's NEURALWATT_API_TOKEN and never billed to a connected user's account. Consequently
+  // it produces no AI Gateway logs, so no cost is recorded for it (aiGatewayLogRoute is absent).
+  if (config.provider === "neuralwatt") {
+    let apiToken = config.apiToken || env.NEURALWATT_API_TOKEN;
+    if (!apiToken) {
+      throw new Error(
+          "Neuralwatt models require a Neuralwatt API key. Set the NEURALWATT_API_TOKEN secret on " +
+          "this Worker, or re-add the model with your own key.");
+    }
+    return getModelDirect({ ...config, apiToken }, options.sessionAffinity);
+  }
+
   // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
   // Workers AI), routed through the user's own AI Gateway with unified billing. Honored regardless
   // of whether a platform AI Gateway is configured, so connected users are always billed correctly.
@@ -869,6 +903,27 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           ...window,
         },
         ...directAuth(config, "Authorization"),
+        sessionAffinity,
+      });
+    case "neuralwatt":
+      // OpenAI-compatible completions endpoint (not the Responses API). Every model in the
+      // Neuralwatt catalog advertises tool calling; `reasoning` is left on because the models we
+      // list are the reasoning variants (the `-fast` aliases disable it). Cost stays zero on
+      // purpose: Neuralwatt bills by energy consumed, so a per-token cost would be fiction.
+      return makeHandle({
+        model: {
+          id: config.model,
+          name: config.model,
+          api: "openai-completions",
+          provider: "neuralwatt",
+          baseUrl: (config.apiUrl ?? "https://api.neuralwatt.com/v1").replace(/\/+$/, ""),
+          reasoning: true,
+          input: ["text", "image"],
+          cost: ZERO_COST,
+          ...window,
+          compat: neuralwattCompat(),
+        },
+        apiKey: config.apiToken,
         sessionAffinity,
       });
     case "openai":

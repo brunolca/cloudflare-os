@@ -68,6 +68,12 @@ export function gatewayRunConfig(
   };
 }
 
+// Fallback quick model for deployments that don't enable Workers AI. Reaching the Workers AI
+// endpoint needs account-scoped Cloudflare credentials, which a gateway-only token doesn't carry,
+// so a deployment without "cloudflare" in CF_AI_GATEWAY_PROVIDERS would fail every title
+// generation. This is the cheapest Neuralwatt model and is plenty for naming a chat.
+const NEURALWATT_QUICK_MODEL_ID = "deepseek-v4-flash";
+
 export class AiGatewayConfig {
   readonly gateway: string;
   /**
@@ -130,6 +136,16 @@ export class AiGatewayConfig {
           `${names} provider${httpsOnly.length > 1 ? "s" : ""} requires ` +
           "CF_AI_GATEWAY_API_TOKEN.");
     }
+    // Neuralwatt rides this provider list so its models are advertised alongside the gateway's,
+    // but it is reached directly rather than through the Gateway (see ai-models.ts getModel), so
+    // the Gateway's server-managed keys never apply to it. Fail at construction rather than
+    // letting every neuralwatt request die individually at stream time.
+    if (this.providers.has("neuralwatt") && !env.NEURALWATT_API_TOKEN) {
+      throw new Error(
+          "NEURALWATT_API_TOKEN is required when \"neuralwatt\" is listed in " +
+          "CF_AI_GATEWAY_PROVIDERS. Neuralwatt has no AI Gateway provider, so it is called " +
+          "directly and cannot use the Gateway's stored keys.");
+    }
   }
 
   /**
@@ -146,12 +162,17 @@ export class AiGatewayConfig {
    * Get the AiModelConfig for the quick model (used for title generation).
    */
   getQuickModelConfig(): AiModelConfig | undefined {
-    // Always use Workers AI here.
-    return {
-      provider: "cloudflare",
-      model: QUICK_MODEL_ID,
-      apiToken: "",
-    };
+    // Prefer Workers AI, which is the cheapest option and needs no extra credentials when the
+    // deployment enables it. Deployments that don't list "cloudflare" have no route to it, so fall
+    // back to Neuralwatt; if neither is enabled, return undefined and callers skip the quick-model
+    // work entirely (chats keep their default titles) rather than issuing calls that must fail.
+    if (this.providers.has("cloudflare")) {
+      return { provider: "cloudflare", model: QUICK_MODEL_ID, apiToken: "" };
+    }
+    if (this.providers.has("neuralwatt")) {
+      return { provider: "neuralwatt", model: NEURALWATT_QUICK_MODEL_ID, apiToken: "" };
+    }
+    return undefined;
   }
 }
 

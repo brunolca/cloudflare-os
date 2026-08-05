@@ -6,6 +6,7 @@ import type {
 
 /** Each provider's name as the model forms and lists show it. */
 export const PROVIDER_LABELS: Record<AiModelProvider, string> = {
+  neuralwatt: 'Neuralwatt',
   anthropic: 'Anthropic',
   openai: 'OpenAI',
   google: 'Google',

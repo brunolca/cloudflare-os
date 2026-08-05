@@ -17,8 +17,10 @@ export type ModelSuggestion = GatewayModel
 
 // Each provider's ID in models.dev, or null where models.dev has no list to suggest from: an Ollama
 // server offers whatever its operator pulled. Total over AiModelProvider, so a provider added there
-// does not compile until it is decided here.
+// does not compile until it is decided here. Neuralwatt is null because its models are the ones
+// SUGGESTED_MODELS lists.
 const MODELS_DEV_PROVIDER_IDS: Record<AiModelProvider, string | null> = {
+  neuralwatt: null,
   anthropic: 'anthropic',
   openai: 'openai',
   google: 'google',
