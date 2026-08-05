@@ -917,7 +917,12 @@ export type CloudflareAccountOption = {
 };
 
 // Supported AI providers.
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+//
+// "neuralwatt" is an OpenAI-compatible provider (https://api.neuralwatt.com/v1) that bills by
+// energy rather than tokens. Cloudflare AI Gateway has no neuralwatt provider, so unlike the
+// others it is never gateway-routed -- see the short-circuit in ai-models.ts getModel().
+export type AiModelProvider =
+    "neuralwatt" | "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
 
 // Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`.
 export type AiGatewayInfo = {
@@ -959,6 +964,20 @@ export const SUGGESTED_MODELS: Record<
   AiModelProvider,
   Record<string, {name: string, contextWindow: number, outputLimit?: number}>
 > = {
+  // Listed first deliberately: getModelList() preserves this order, and both the model picker and
+  // the "first available model" fallback in UserDurableObject.getExternalMessageChatContext() take
+  // the head of that list -- so whichever provider leads this object is the deployment default.
+  //
+  // Context windows are the exact `max_model_len` values advertised by https://api.neuralwatt.com/v1
+  // /models; `outputLimit` is set only where that catalog declares a max_output_tokens.
+  "neuralwatt": {
+    "kimi-k2.7-code": {name: "Kimi K2.7 Code (Neuralwatt)", contextWindow: 262128},
+    "glm-5.2": {name: "GLM 5.2 (Neuralwatt)", contextWindow: 1048560},
+    "kimi-k3": {name: "Kimi K3 (Neuralwatt)", contextWindow: 1048560},
+    "deepseek-v4-flash": {
+      name: "DeepSeek V4 Flash (Neuralwatt)", contextWindow: 1048560, outputLimit: 65536,
+    },
+  },
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {
       name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,

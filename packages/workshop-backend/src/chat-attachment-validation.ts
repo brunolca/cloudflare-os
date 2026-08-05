@@ -37,6 +37,9 @@ const ATTACHMENT_SUPPORT_BY_PROVIDER = {
   openai: isTextImageOrPdfMime,
   google: isTextImageOrPdfMime,
   cloudflare: isTextOrImageMime,
+  // Neuralwatt's models take images, but its OpenAI-compatible endpoint exposes no native
+  // document input, so PDFs have nothing to be bridged onto (as with Workers AI and Ollama).
+  neuralwatt: isTextOrImageMime,
   ollama: isTextOrImageMime,
 } satisfies Record<AiModelProvider, (mimeType: string) => boolean>;
 
