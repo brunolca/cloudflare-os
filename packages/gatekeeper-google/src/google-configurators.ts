@@ -5,6 +5,7 @@ import { GoogleCalendarApi } from "./calendar-api";
 import { GoogleAccessToken } from "./google-api";
 import type { BigQueryConfiguratorRpc } from "./configurator/bigquery-configurator-types";
 import type { CalendarConfiguratorRpc } from "./configurator/calendar-configurator-types";
+import type { DriveConfiguratorRpc } from "./configurator/drive-configurator-types";
 import type { GmailConfiguratorRpc } from "./configurator/gmail-configurator-types";
 import type { GoogleDocConfiguratorRpc } from "./configurator/google-doc-configurator-types";
 import type { GoogleSheetsConfiguratorRpc } from "./configurator/google-sheets-configurator-types";
@@ -119,6 +120,79 @@ async function listDriveFiles(
       subtitle: subtitleParts.join(" · "),
     };
   });
+}
+
+const DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
+
+// List Drive items for the Drive configurator's pickers. Unlike listDriveFiles(), this stays inside
+// the corpus a Drive binding can actually read: My Drive only, so the picker cannot offer a
+// shared-drive or shared-with-me item that every later read would reject.
+async function listMyDriveItems(
+  target: object,
+  query: string,
+  mode: "folders" | "files",
+): Promise<ConfiguratorOption[]> {
+  let token = await googleToken(target);
+  let url = new URL("https://www.googleapis.com/drive/v3/files");
+  url.searchParams.set("pageSize", "100");
+  url.searchParams.set("fields", "files(id,name,mimeType,modifiedTime)");
+  url.searchParams.set("orderBy", "folder,modifiedTime desc");
+  url.searchParams.set("spaces", "drive");
+
+  let clauses = ["trashed = false", "sharedWithMe = false"];
+  clauses.push(
+    mode === "folders"
+      ? `mimeType = '${DRIVE_FOLDER_MIME_TYPE}'`
+      : `mimeType != '${DRIVE_FOLDER_MIME_TYPE}'`,
+  );
+  let trimmed = query.trim();
+  if (trimmed) {
+    // Drive query strings use single-quoted literals; Google documents escaping ' as \'.
+    let escaped = trimmed.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    clauses.push(`name contains '${escaped}'`);
+  }
+  url.searchParams.set("q", clauses.join(" and "));
+
+  let response = await fetch(url.toString(), {
+    headers: { "Authorization": `Bearer ${token.token}` },
+  });
+  if (!response.ok) {
+    let text = await response.text();
+    if (response.status === 403 && text.includes("Google Drive API has not been used")) {
+      throw new Error(
+        "Drive search requires the Google Drive API to be enabled for this OAuth project.",
+      );
+    }
+    throw new Error(`Failed to search Google Drive: ${response.status} ${text}`);
+  }
+  let body = await response.json<{
+    files?: { id: string, name: string, mimeType?: string, modifiedTime?: string }[],
+  }>();
+  return (body.files ?? []).map(file => ({
+    value: file.id,
+    title: file.name,
+    ...(file.modifiedTime
+      ? { subtitle: `Modified ${new Date(file.modifiedTime).toLocaleDateString()}` }
+      : {}),
+    ...(mode === "files" && file.mimeType ? { meta: file.mimeType } : {}),
+  }));
+}
+
+// RPC interface exposed by Gatekeeper to the resource selection/configuration iframe.
+@validateRpc()
+export class DriveConfiguratorUI extends RpcTarget implements DriveConfiguratorRpc {
+  constructor(getToken: () => Promise<GoogleAccessToken>) {
+    super();
+    googleTokenGetters.set(this, getToken);
+  }
+
+  async listFolders(query: string): Promise<ConfiguratorOption[]> {
+    return listMyDriveItems(this, query, "folders");
+  }
+
+  async listFiles(query: string): Promise<ConfiguratorOption[]> {
+    return listMyDriveItems(this, query, "files");
+  }
 }
 
 // RPC interface exposed by Gatekeeper to the resource selection/configuration iframe.
