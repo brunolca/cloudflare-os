@@ -275,6 +275,25 @@ export interface DriveFile {
    */
   copyTo(destination: DriveFolder, name?: string): Promise<DriveFile>;
 
+  /**
+   * Convert this file into a new Google Doc in `destination`, running Google's OCR over it, and
+   * return the Doc. Use it to get at the text of a scan or a PDF: `readText()` on the result
+   * returns the recognized text as Markdown.
+   *
+   * Only PDFs and raster images (JPEG, PNG, GIF, BMP, TIFF, WebP) can be converted; anything else
+   * throws, and a file that already has a text form should be read with `readText()` directly.
+   * `ocrLanguage` is an ISO 639-1 hint such as `"fr"`.
+   *
+   * The Doc is a real new file that stays in `destination` until you trash it. Its text is only
+   * available once the conversion has actually been committed, so read it on a later pass rather
+   * than immediately after asking for it. Accuracy and page coverage are Google's OCR's, not
+   * this API's — check the result rather than assuming a long scan converted in full.
+   */
+  convertToDoc(
+    destination: DriveFolder,
+    options?: { name?: string; ocrLanguage?: string },
+  ): Promise<DriveFile>;
+
   /** Move this file to the trash. */
   trash(): Promise<void>;
 

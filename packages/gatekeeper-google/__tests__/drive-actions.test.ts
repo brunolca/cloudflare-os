@@ -115,6 +115,20 @@ describe("pendingItemInfo", () => {
     expect(isSyntheticId(info.id)).toBe(true);
   });
 
+  it("presents a pending OCR conversion as the Doc it will become", () => {
+    let overlay = buildDriveOverlay(pending({
+      type: "copy", syntheticId: syntheticId(1), sourceId: "scan", parentId: "receipts",
+      name: "Invoice March", mimeType: "application/vnd.google-apps.document",
+      targetMimeType: "application/vnd.google-apps.document", ocrLanguage: "fr",
+      submittedAt: SUBMITTED_AT,
+    }));
+
+    let info = pendingItemInfo(overlay.created.get(syntheticId(1))!);
+    // Not the source PDF: the pending item is the converted Doc, and Docs carry no size.
+    expect(info).toMatchObject({ nativeType: "document", name: "Invoice March" });
+    expect(info.sizeBytes).toBeUndefined();
+  });
+
   it("maps a Google editor MIME type to its native type", () => {
     let overlay = buildDriveOverlay(pending({
       type: "copy", syntheticId: syntheticId(1), sourceId: "abc", parentId: "root",
