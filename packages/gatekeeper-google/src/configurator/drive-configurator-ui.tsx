@@ -32,14 +32,22 @@ export default {
   },
 
   initialValuesFromResourceUrl({ resourceUrl }) {
-    let path = new URL(resourceUrl).pathname.split("/").filter(Boolean);
-    // /drive/folders/<id>
-    if (path[0] === "drive" && path[1] === "folders" && path[2]) {
-      return { scope: "folder", folderId: decodeURIComponent(path[2]) };
+    let path = new URL(resourceUrl).pathname.split("/").filter(Boolean)
+        .map(segment => decodeURIComponent(segment));
+    // Normalize the way the gatekeeper's own parser does, so a URL copied out of Drive's UI
+    // pre-fills the granularity it names. Drive writes the signed-in account into the path
+    // (/drive/u/0/folders/<id>) whenever more than one account is signed in, and treating that as
+    // unrecognized would silently pre-fill whole-Drive for a URL that named one folder.
+    if (path[0] === "drive") path.shift();
+    if (path[0] === "u" && /^\d+$/.test(path[1] ?? "")) path.splice(0, 2);
+
+    // folders/<id>
+    if (path[0] === "folders" && path[1]) {
+      return { scope: "folder", folderId: path[1] };
     }
-    // /file/d/<id>
+    // file/d/<id>
     if (path[0] === "file" && path[1] === "d" && path[2]) {
-      return { scope: "file", fileId: decodeURIComponent(path[2]) };
+      return { scope: "file", fileId: path[2] };
     }
     return { scope: "drive" };
   },
