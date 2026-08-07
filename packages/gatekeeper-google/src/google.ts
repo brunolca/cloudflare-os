@@ -13,7 +13,8 @@ import type {
   GoogleSpreadsheetSession, SpreadsheetInfo, SpreadsheetRange, SpreadsheetValueMode,
 } from "./sheets-types";
 import {
-  DrivePage, GoogleDriveApi, MAX_BINARY_BYTES, MAX_TEXT_BYTES, parentGroups, textSourceFor,
+  DrivePage, GOOGLE_DOC_MIME_TYPE, GoogleDriveApi, isOcrConvertible, MAX_BINARY_BYTES,
+  MAX_TEXT_BYTES, parentGroups, textSourceFor,
 } from "./drive-api";
 import {
   buildDriveOverlay, createdSyntheticId, DriveIdMap, DrivePendingContentStore, isSyntheticId,
@@ -3981,6 +3982,15 @@ function driveRealId(ctx: DriveSessionContext, id: string): string | undefined {
   return isSyntheticId(resolved) ? undefined : resolved;
 }
 
+// ISO 639-1: two letters, optionally with a region subtag Google also accepts (e.g. "zh-CN").
+function checkOcrLanguage(language: string): string {
+  if (typeof language !== "string" || !/^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(language)) {
+    throw new Error(
+      `Invalid OCR language "${language}". Use an ISO 639-1 code such as "en" or "fr".`);
+  }
+  return language;
+}
+
 function checkDriveName(name: string, what: string): string {
   if (typeof name !== "string") throw new Error(`A ${what} name must be a string.`);
   let trimmed = name.trim();
@@ -4892,6 +4902,67 @@ class DriveFileImpl extends RpcTarget implements DriveFileSession {
     return new DriveFileImpl(this.#ctx, syntheticId(actionId));
   }
 
+  async convertToDoc(
+    destination: DriveFolder,
+    options?: { name?: string; ocrLanguage?: string },
+  ): Promise<DriveFile> {
+    let destinationId = await resolveDriveDestination(this.#ctx, destination);
+    let overlay = driveOverlay(this.#ctx);
+    let info = await this.#info(overlay);
+
+    if (info.nativeType !== undefined) {
+      throw new Error(
+        `"${info.name}" is already a Google ${info.nativeType}; read it with readText() instead ` +
+        "of converting it.");
+    }
+    if (!isOcrConvertible(info.mimeType)) {
+      throw new Error(
+        `"${info.name}" (${info.mimeType}) cannot be converted. Only PDFs and raster images can ` +
+        "be run through OCR.");
+    }
+    let realId = driveRealId(this.#ctx, this.#fileId);
+    if (realId === undefined) {
+      throw new Error(
+        "This file has not been created in Drive yet, so it cannot be converted. Approve the " +
+        "upload that creates it first.");
+    }
+
+    let docName = options?.name === undefined
+        ? info.name.replace(/\.[^./\\]+$/, "").slice(0, MAX_DRIVE_NAME_LENGTH) || info.name
+        : checkDriveName(options.name, "file");
+    let ocrLanguage = options?.ocrLanguage === undefined
+        ? undefined
+        : checkOcrLanguage(options.ocrLanguage);
+    let sourceId = this.#fileId;
+
+    let actionId = await submitDriveAction(
+      this.#ctx,
+      id => ({
+        type: "copy",
+        syntheticId: syntheticId(id),
+        sourceId,
+        parentId: destinationId,
+        name: docName,
+        // The copy is a Doc, not another PDF, so the pending item reads back as one. Google
+        // editor files carry no size, so none is recorded.
+        mimeType: GOOGLE_DOC_MIME_TYPE,
+        targetMimeType: GOOGLE_DOC_MIME_TYPE,
+        ...(ocrLanguage ? { ocrLanguage } : {}),
+        submittedAt: Date.now(),
+      }),
+      () => ({
+        title: `Convert Drive file to a Doc: ${info.name}`,
+        description:
+          `Run Google's OCR over a ${info.mimeType} and save the recognized text as a new Google ` +
+          `Doc.${ocrLanguage ? ` Language hint: ${ocrLanguage}.` : ""}\n\n` +
+          formatApprovalField("Source", info.name) + "\n\n" +
+          formatApprovalField("New document", docName),
+        implementsRevert: true,
+      }),
+    );
+    return new DriveFileImpl(this.#ctx, syntheticId(actionId));
+  }
+
   async trash(): Promise<void> {
     await submitDriveTrash(this.#ctx, this.#fileId, "file", true);
   }
@@ -5133,7 +5204,11 @@ class DriveActionRunner {
         let created = await this.#api.copyFile(
             this.#idMap.resolve(action.sourceId),
             this.#idMap.resolve(action.parentId),
-            action.name);
+            action.name,
+            {
+              ...(action.targetMimeType ? { targetMimeType: action.targetMimeType } : {}),
+              ...(action.ocrLanguage ? { ocrLanguage: action.ocrLanguage } : {}),
+            });
         this.#idMap.record(action.syntheticId, created.info.id);
         this.#recordRevert(actionId, {
           type: "created", fileId: created.info.id, name: created.info.name,

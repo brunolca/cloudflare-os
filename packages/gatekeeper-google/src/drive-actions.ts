@@ -62,8 +62,13 @@ export type DriveCopyAction = ActionBase & {
   sourceId: string;
   parentId: string;
   name: string;
+  /** MIME type the copy will have — the conversion target when `targetMimeType` is set. */
   mimeType: string;
   sizeBytes?: number;
+  /** Set when the copy is a format conversion, e.g. a PDF to a Doc via OCR. */
+  targetMimeType?: string;
+  /** ISO 639-1 hint for the OCR pass. */
+  ocrLanguage?: string;
 };
 
 export type DriveWriteAction = ActionBase & {

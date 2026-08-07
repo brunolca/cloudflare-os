@@ -765,12 +765,41 @@ export class GoogleDriveApi {
       await this.#requestJsonWithBody<RestDriveFile>(url, "PATCH", body));
   }
 
-  async copyFile(sourceId: string, parentId: string, name: string): Promise<DriveFileRecord> {
+  /**
+   * Copy a file, optionally converting it on the way.
+   *
+   * Passing `targetMimeType` is how Drive performs a format conversion: copying a PDF or image to
+   * `application/vnd.google-apps.document` runs Google's OCR and produces a Doc whose body is the
+   * recognized text. `ocrLanguage` is an ISO 639-1 hint for that pass.
+   */
+  async copyFile(
+    sourceId: string,
+    parentId: string,
+    name: string,
+    options?: { targetMimeType?: string; ocrLanguage?: string },
+  ): Promise<DriveFileRecord> {
     let url = new URL(`${API_BASE}/${encodeURIComponent(sourceId)}/copy`);
     url.searchParams.set("fields", FILE_FIELDS);
+    if (options?.ocrLanguage) url.searchParams.set("ocrLanguage", options.ocrLanguage);
     return this.#toRecord(await this.#requestJsonWithBody<RestDriveFile>(url, "POST", {
       name,
       parents: [parentId],
+      ...(options?.targetMimeType ? { mimeType: options.targetMimeType } : {}),
     }));
   }
+}
+
+/** MIME type of a Google Doc, the conversion target for OCR. */
+export const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
+
+/**
+ * Whether Drive can convert this type to a Doc with OCR. Google accepts PDFs and the common raster
+ * image formats; anything else either has no text to recognize or is already text we can read
+ * directly with `textSourceFor()`.
+ */
+export function isOcrConvertible(mimeType: string): boolean {
+  return mimeType === "application/pdf" ||
+      mimeType === "image/jpeg" || mimeType === "image/png" ||
+      mimeType === "image/gif" || mimeType === "image/bmp" ||
+      mimeType === "image/tiff" || mimeType === "image/webp";
 }
