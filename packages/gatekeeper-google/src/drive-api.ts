@@ -38,7 +38,8 @@ const TEXT_MIME_TYPES = new Set([
 
 const FILE_FIELDS =
   "id,name,mimeType,size,createdTime,modifiedTime,lastModifyingUser(displayName),ownedByMe," +
-  "trashed,starred,webViewLink,parents,sharedWithMe,driveId,shortcutDetails(targetId)";
+  // `sharedWithMe` is a query term only; the File resource spells the same fact as a timestamp.
+  "trashed,starred,webViewLink,parents,sharedWithMeTime,driveId,shortcutDetails(targetId)";
 
 /** Text beyond this is truncated rather than refused, so a huge file still yields something. */
 export const MAX_TEXT_BYTES = 5 * 1024 * 1024;
@@ -77,7 +78,7 @@ type RestDriveFile = {
   starred?: boolean;
   webViewLink?: string;
   parents?: string[];
-  sharedWithMe?: boolean;
+  sharedWithMeTime?: string;
   driveId?: string;
   shortcutDetails?: { targetId?: string };
 };
@@ -342,7 +343,7 @@ export class GoogleDriveApi {
       throw new Error(
         `Drive item ${rest.id} lives in a shared drive, which this connection cannot access.`);
     }
-    if (rest.sharedWithMe) {
+    if (rest.sharedWithMeTime !== undefined) {
       throw new Error(
         `Drive item ${rest.id} is shared with this account rather than owned by it, so this ` +
         "connection cannot access it.");
