@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AiChatAuthorInfo, AiModelConfig } from "@gadgets/workshop-shared/api";
 import { getModel, type ModelHandle } from "../src/ai-models.js";
-import { getAiGatewayConfig } from "../src/ai-gateway.js";
+import { GatewayModels, getAiGatewayConfig } from "../src/ai-gateway.js";
+import { DEFAULT_ADMIN_CONFIG } from "../src/storage-schema/admin-settings-storage.js";
 
 // Neuralwatt is the one provider that is advertised through CF_AI_GATEWAY_PROVIDERS but never
 // routed through AI Gateway (the Gateway has no neuralwatt provider). These tests pin that
@@ -145,11 +146,12 @@ describe("AiGatewayConfig with neuralwatt enabled", () => {
     const config = getAiGatewayConfig(env({
       CF_AI_GATEWAY_PROVIDERS: "neuralwatt,anthropic",
     }))!;
-    const ids = config.getModelList().map(model => model.id);
+    const models = new GatewayModels(config, DEFAULT_ADMIN_CONFIG);
+    const ids = models.list("language").map(model => model.id);
 
     expect(ids[0]).toBe("kimi-k2.7-code");
-    expect(ids).toContain("claude-opus-5");
-    expect(config.resolveModel("glm-5.2")?.config.provider).toBe("neuralwatt");
+    expect(ids).toContain("claude-opus-5-5");
+    expect(models.get("glm-5.2")?.provider).toBe("neuralwatt");
   });
 
   it("falls back to a Neuralwatt quick model when Workers AI is not enabled", () => {

@@ -146,6 +146,22 @@ Collaborators share the gadget's code, storage, and AI chat history, but certain
 
 This means no collaborator implicitly gains access to another user's connected third-party accounts.
 
+## Gadget-level identity
+
+The roles above govern access *to* a gadget. They say nothing about what happens inside one: by default every collaborator who reaches `connectToGadget()` gets a stub onto the same Durable Object facet, so gadget code cannot tell its users apart and cannot restrict what any of them call. Hiding a control in `client.js` is not an access control -- the client is untrusted code in the collaborator's own browser, and a `use` collaborator can invoke any method on the gadget's server with any arguments.
+
+A gadget that needs to know who it is talking to defines an optional `onConnect(user)` method on its `Gadget` class. `getGadgetFacet()` calls it once per connection, passing a `GadgetUser` (`{id, name, role, isOwner}`) assembled from the session that `open()` already authorized -- `id` is the caller's profile ID, the same key the permission graph uses. The identity never passes through the sandbox on its way in, so gadget code may trust it.
+
+What `onConnect()` returns decides the shape of the connection:
+
+- **Nothing** -- the client keeps talking to the main Durable Object, exactly as before. This suffices for presence, attribution, and per-user state.
+- **An object** -- that object becomes the client's stub for the connection, and only the methods on it are reachable. This is the only way a gadget can actually restrict a collaborator, since it removes the privileged methods from the capability rather than hiding them in the UI.
+
+Two deliberate details:
+
+- **Absent `onConnect()` is not an error.** Every gadget written before this existed has none, so the platform distinguishes "method not implemented" (fall back to the bare facet) from an error thrown *inside* `onConnect()` (fail the connection). It matches workerd's not-implemented message exactly rather than by substring, because a substring match would also swallow a `TypeError` raised by the gadget's own code -- silently downgrading a gadget that gates access to one that doesn't. See `isGadgetConnectNotImplemented` in `overseer.ts`.
+- **Only sessions carry identity.** The coding agent reaching a gadget through a binding, gadget-to-gadget calls, PDF export, and hook delivery all use the bare facet and never trigger `onConnect()`. The agent already holds build-level access to the gadget's code, so this grants it nothing it couldn't otherwise do -- but a gadget must not treat `onConnect()` as its only entry point.
+
 ## Authorization model
 
 Authorization is enforced at `open()`: the method computes the caller's effective role from the permission graph (`getEffectiveRole()`), treating the owner as the implicit `build` root. A caller with no effective role receives `WORKSPACE_ACCESS_DENIED`, while an uninitialized or deleted gadget receives `WORKSPACE_NOT_FOUND`. This distinction acknowledges that an initialized workspace exists, but the denial exposes no workspace name, owner, or content. Otherwise the role selects which capability is returned (full `OverseerClientInterface` for `build`/owner, restricted `UseOverseerInterface` for `use`). (Note: `UseOverseerInterface` still throws `Unauthorized` when a *valid* `use` collaborator calls a `build`-only method -- that's a different case, where existence is already known and only the operation is denied.)
