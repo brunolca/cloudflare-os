@@ -2856,6 +2856,35 @@ export interface GatekeeperClient<Session extends RpcCompatible<Session>> extend
 // min(edge role, sharer's effective role). The owner is the implicit root at "build".
 export type CollaboratorRole = "build" | "use";
 
+// Identity of whoever is driving one connection to a Gadget's server, handed to the Gadget's
+// optional server-side `onConnect()` method (see OverseerImpl.getGadgetFacet).
+//
+// This is filled in by the platform from the session that opened the Gadget -- it never crosses
+// the sandbox boundary on its way in, so Gadget code may trust it for authorization. Contrast
+// with anything the client passes up through the `gadget` RPC stub, which is attacker-controlled:
+// a `use` collaborator can call any method on the Gadget's Durable Object with any arguments.
+//
+// Only sessions get an identity. The coding agent reaching a Gadget through a binding, a Gadget
+// calling another Gadget, PDF export, and hook delivery all keep the bare Durable Object stub and
+// never trigger onConnect() -- so a Gadget must not treat "onConnect() was called" as the only way
+// it is reachable. (The agent already holds build-level access to the Gadget's code, so this
+// grants it nothing it could not otherwise do.)
+export type GadgetUser = {
+  // Stable identifier -- the caller's profile ID, e.g. "kenton@cloudflare.com". This is the same
+  // key the sharing graph uses, so it's suitable as a storage key for per-user Gadget state.
+  id: string;
+
+  // Display name, e.g. "Kenton Varda". For presentation only: not unique, and it can change.
+  name: string;
+
+  // The caller's effective role on this Gadget, as computed by the sharing graph at open() time.
+  role: CollaboratorRole;
+
+  // Whether this caller owns the Gadget. The owner is the root of the permission graph and is
+  // always "build".
+  isOwner: boolean;
+};
+
 // One person currently connected to a gadget.
 export type PresenceParticipant = {
   // Opaque key matching this participant across add/remove events.
