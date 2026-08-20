@@ -42,6 +42,11 @@ const ATTACHMENT_SUPPORT_BY_PROVIDER = {
   // Neuralwatt's models take images, but its OpenAI-compatible endpoint exposes no native
   // document input, so PDFs have nothing to be bridged onto (as with Workers AI and Ollama).
   neuralwatt: isTextOrImageMime,
+  // Text only: this gate is per-provider, but Cerebras is split per-model -- only gemma-4-31b
+  // declares image input, while gpt-oss-120b and zai-glm-4.7 are text-only and would hard-fail on
+  // an image part. Allowing images provider-wide would trade a clear upload rejection for a
+  // provider error mid-turn on two of the three models.
+  cerebras: isTextLikeAttachmentMimeType,
   ollama: isTextOrImageMime,
 } satisfies Record<AiModelProvider, (mimeType: string) => boolean>;
 

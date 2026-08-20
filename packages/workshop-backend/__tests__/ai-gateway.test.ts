@@ -581,7 +581,7 @@ describe("GatewayModels", () => {
   });
 
   describe("providers", () => {
-    const CATALOG_ORDER = ["cloudflare", "anthropic", "openai", "google"];
+    const CATALOG_ORDER = ["cerebras", "cloudflare", "anthropic", "openai", "google"];
     const GEMINI = "gemini-3.6-flash";
     const NO_TOKEN = 'Provider "google" cannot use the Workers AI binding transport, and no ' +
         "CF_AI_GATEWAY_API_TOKEN is configured for the HTTPS one.";
@@ -626,6 +626,7 @@ describe("GatewayModels", () => {
     it("says who enabled each provider the gateway serves, in catalog order", () => {
       expect(gatewayModels({ addedProviders: ["google"] }, "anthropic,ollama").providerSettings)
           .toStrictEqual([
+            { provider: "cerebras", needsApiToken: false },
             { provider: "cloudflare", needsApiToken: false },
             { provider: "anthropic", enabledBy: "environment", needsApiToken: false },
             { provider: "openai", needsApiToken: false },
@@ -634,7 +635,7 @@ describe("GatewayModels", () => {
       // The environment's listing comes first, so a provider it lists can't be turned off.
       expect(gatewayModels({ addedProviders: ["anthropic", "cloudflare"] }, "anthropic")
           .providerSettings.map(({ enabledBy }) => enabledBy))
-          .toEqual(["admin", "environment", undefined, undefined]);
+          .toEqual([undefined, "admin", "environment", undefined, undefined]);
     });
 
     it("reports a provider whose requests need a token the deployment lacks", () => {

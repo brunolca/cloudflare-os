@@ -46,6 +46,12 @@ const WORKERS_AI_CONFIG: AiModelConfig = {
   apiToken: "ignored-in-gateway-mode",
 };
 
+const CEREBRAS_CONFIG: AiModelConfig = {
+  provider: "cerebras",
+  model: "gpt-oss-120b",
+  apiToken: "ignored-in-gateway-mode",
+};
+
 function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
   return {
     CF_AI_GATEWAY: "platform-gateway",
@@ -1015,6 +1021,9 @@ describe("gateway model reasoning levels", () => {
     ["neuralwatt", "glm-5.2", null],
     ["neuralwatt", "kimi-k3", null],
     ["neuralwatt", "deepseek-v4-flash", null],
+    ["cerebras", "gpt-oss-120b", null],
+    ["cerebras", "zai-glm-4.7", null],
+    ["cerebras", "gemma-4-31b", null],
   ];
   it.each(BUILT_IN)("says what %s model %s is asked for while no level is set",
       (provider, model, builtIn) => {
@@ -1903,4 +1912,99 @@ describe("getDecisionModel routing", () => {
       });
     });
   });
+});
+
+
+describe("getModel Cerebras routing", () => {
+  beforeEach(() => {
+    capturedRequests.length = 0;
+  });
+
+  function cerebrasEnv(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
+    return env({ CF_AI_GATEWAY_PROVIDERS: "cerebras,neuralwatt", ...overrides });
+  }
+
+  it("routes through the gateway's native cerebras path, which carries no /v1 segment", async () => {
+    // Unlike the workers-ai route (/workers-ai/v1), the gateway exposes Cerebras' chat/completions
+    // directly under /cerebras -- so the base URL must not gain a version segment.
+    const handle = getModel(cerebrasEnv(), CEREBRAS_CONFIG, INITIATOR, {
+      metadata: { source: "chat", chatId: 7 },
+    });
+
+    expect(handle.model.api).toBe("openai-completions");
+    expect(handle.model.id).toBe("gpt-oss-120b");
+    expect(handle.model.baseUrl).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/cerebras");
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/cerebras/" +
+        "chat/completions");
+    // Stored key on the gateway, as for every other gateway-routed provider.
+    expect(request.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
+    expect(request.headers.get("authorization")).toBeNull();
+  }, 15000);
+
+  it("prices Cerebras from pi's catalog rather than zeroing it", () => {
+    // The chat cost indicator is only meaningful if the descriptor carries real per-token cost.
+    // Neuralwatt is deliberately zeroed (energy-billed); Cerebras must not be.
+    const handle = getModel(cerebrasEnv(), CEREBRAS_CONFIG, INITIATOR, {});
+
+    expect(handle.model.cost.input).toBeGreaterThan(0);
+    expect(handle.model.cost.output).toBeGreaterThan(0);
+    expect(handle.model.contextWindow).toBe(131072);
+    expect(handle.model.maxTokens).toBe(40960);
+  });
+
+  it("sends the system role, never the developer role", async () => {
+    // pi infers OpenAI-compat conventions from the base URL, which here is the gateway's, so the
+    // explicit compat flag is what keeps the `developer` role out of the request.
+    const handle = getModel(cerebrasEnv(), CEREBRAS_CONFIG, INITIATOR, {});
+    const stream = await handle.stream(handle.model, {
+      systemPrompt: "You are a careful assistant.",
+      messages: [{ role: "user", content: "hello", timestamp: 0 }],
+    }, { fetch: fetchStub, maxRetries: 0 });
+    await stream.result();
+
+    const body = JSON.parse(capturedRequests[0].body);
+    const roles = body.messages.map((m: { role: string }) => m.role);
+    expect(roles).toContain("system");
+    expect(roles).not.toContain("developer");
+    expect(body.store).toBeUndefined();
+  }, 15000);
+
+  it("keeps the compat flags for a model id the catalog does not know", () => {
+    const handle = getModel(
+        cerebrasEnv(), { ...CEREBRAS_CONFIG, model: "some-future-model" }, INITIATOR, {});
+
+    expect(handle.model.compat).toMatchObject({
+      supportsStore: false,
+      supportsDeveloperRole: false,
+    });
+  });
+
+  it("rides the Workers AI binding when one is bound", async () => {
+    const handle = getModel(
+        cerebrasEnv({ WORKERS_AI: {} as Ai }), CEREBRAS_CONFIG, INITIATOR, {});
+
+    expect(handle.model.baseUrl).toBe(
+        "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/cerebras");
+    expect(handle.aiGatewayLogRoute).toEqual({ gateway: "platform-gateway" });
+
+    const request = await captureRequest(handle);
+    expect(request.headers.get("cf-aig-authorization")).toBe("Bearer cloudflare-gateway-binding");
+  }, 15000);
+
+  it("calls Cerebras directly with the model's own key when no gateway is configured", async () => {
+    const handle = getModel(
+        env({ CF_AI_GATEWAY: undefined }),
+        { ...CEREBRAS_CONFIG, apiToken: "csk-user-key" }, INITIATOR, {});
+
+    expect(handle.model.baseUrl).toBe("https://api.cerebras.ai/v1");
+    expect(handle.aiGatewayLogRoute).toBeUndefined();
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe("https://api.cerebras.ai/v1/chat/completions");
+    expect(request.headers.get("authorization")).toBe("Bearer csk-user-key");
+  }, 15000);
 });

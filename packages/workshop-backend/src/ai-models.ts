@@ -17,6 +17,7 @@ import { stream as openaiResponsesStream } from "@earendil-works/pi-ai/api/opena
 import { clampThinkingBudgetToAnswerRoom, thinkingBudgetForLevel }
   from "@earendil-works/pi-ai/api/simple-options";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
+import { CEREBRAS_MODELS } from "@earendil-works/pi-ai/providers/cerebras.models";
 import {
   CLOUDFLARE_WORKERS_AI_CLASSIFIER_MODELS, CLOUDFLARE_WORKERS_AI_MODELS,
 } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
@@ -149,6 +150,7 @@ const CATALOGS: Partial<Record<AiModelProvider, Record<string, Model<Api>>>> = {
   openai: OPENAI_MODELS,
   google: GOOGLE_MODELS,
   cloudflare: CLOUDFLARE_WORKERS_AI_MODELS,
+  cerebras: CEREBRAS_MODELS,
 };
 
 // Consult pi's builtin catalog for cost/compat metadata of a known model id. Unknown models are
@@ -264,6 +266,20 @@ function neuralwattCompat(): OpenAICompletionsCompat {
   };
 }
 
+// Compat flags for Cerebras' OpenAI-compatible endpoint. pi's catalog already declares
+// supportsStore/supportsDeveloperRole per model; these defaults cover model ids the catalog does
+// not know (a user-added one, or a model Cerebras ships before pi regenerates). Cerebras rejects
+// `store` and the `developer` role on every model in the catalog, so assuming the same for a new
+// one is the safe direction -- and pi cannot infer it here anyway, since it detects conventions
+// from the base URL, which is the gateway's rather than api.cerebras.ai.
+function cerebrasCompat(catalog: CatalogEntry | undefined): OpenAICompletionsCompat {
+  return {
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    ...(catalog?.compat as OpenAICompletionsCompat | undefined),
+  };
+}
+
 /**
  * Model-field prefix that names Neuralwatt's AI Gateway custom provider on the /compat endpoint.
  * AI Gateway requires every custom provider slug to be prefixed with `custom-`; the slug itself
@@ -356,6 +372,24 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         // requests are otherwise sent no effort at all.
         ...(config.reasoning !== undefined ? { thinkingLevelMap: catalog?.thinkingLevelMap } : {}),
         compat: workersAiCompat(catalog),
+      };
+    case "cerebras":
+      // A built-in gateway provider, so it gets its own native path -- and unlike workers-ai that
+      // path carries no /v1 segment: the gateway exposes chat/completions directly under
+      // /cerebras. Cost, thinking levels and compat come from pi's catalog, so Cerebras usage is
+      // priced properly in the chat cost indicator (unlike energy-billed neuralwatt).
+      return {
+        id: config.model,
+        name: catalog?.name ?? config.model,
+        api: "openai-completions",
+        provider: "cerebras",
+        baseUrl: `${gatewayUrl}/cerebras`,
+        reasoning: catalog?.reasoning ?? true,
+        input: catalog?.input ?? ["text"],
+        cost: catalog?.cost ?? ZERO_COST,
+        ...window,
+        thinkingLevelMap: catalog?.thinkingLevelMap,
+        compat: cerebrasCompat(catalog),
       };
     case "neuralwatt":
       // Neuralwatt is not in AI Gateway's provider catalog, so it is registered as an AI Gateway
@@ -950,6 +984,24 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           ...window,
         },
         ...directAuth(config, "Authorization"),
+        sessionAffinity,
+      });
+    case "cerebras":
+      return makeHandle({
+        model: {
+          id: config.model,
+          name: catalog?.name ?? config.model,
+          api: "openai-completions",
+          provider: "cerebras",
+          baseUrl: config.apiUrl ?? "https://api.cerebras.ai/v1",
+          reasoning: catalog?.reasoning ?? true,
+          input: catalog?.input ?? ["text"],
+          cost: catalog?.cost ?? ZERO_COST,
+          ...window,
+          thinkingLevelMap: catalog?.thinkingLevelMap,
+          compat: cerebrasCompat(catalog),
+        },
+        apiKey: config.apiToken,
         sessionAffinity,
       });
     case "neuralwatt":

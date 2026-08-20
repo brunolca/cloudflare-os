@@ -21,6 +21,7 @@ export type ModelSuggestion = GatewayModel
 // SUGGESTED_MODELS lists.
 const MODELS_DEV_PROVIDER_IDS: Record<AiModelProvider, string | null> = {
   neuralwatt: null,
+  cerebras: 'cerebras',
   anthropic: 'anthropic',
   openai: 'openai',
   google: 'google',

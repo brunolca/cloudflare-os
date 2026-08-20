@@ -1546,7 +1546,7 @@ export type CloudflareAccountOption = {
  * See gatewayNativeModel() and getModel() in ai-models.ts.
  */
 export type AiModelProvider =
-    "neuralwatt" | "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+    "neuralwatt" | "cerebras" | "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -1931,6 +1931,16 @@ const SUGGESTED_MODEL_CATALOG = {
     "deepseek-v4-flash": {
       name: "DeepSeek V4 Flash (Neuralwatt)", contextWindow: 1048560, outputLimit: 65536,
     },
+  },
+  // A built-in AI Gateway provider, reached over its native OpenAI-compatible path. Window and
+  // output limits match pi's generated Cerebras catalog, which also supplies the per-token cost
+  // and compat flags (see catalogModel/gatewayNativeModel) -- so unlike neuralwatt these carry a
+  // real price. Only gemma-4-31b accepts images; the attachment gate is per-provider, so Cerebras
+  // is treated as text-only (see chat-attachment-validation.ts).
+  "cerebras": {
+    "gpt-oss-120b": {name: "GPT OSS 120B (Cerebras)", contextWindow: 131072, outputLimit: 40960},
+    "zai-glm-4.7": {name: "Z.AI GLM-4.7 (Cerebras)", contextWindow: 131072, outputLimit: 40960},
+    "gemma-4-31b": {name: "Gemma 4 31B IT (Cerebras)", contextWindow: 131072, outputLimit: 40960},
   },
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {

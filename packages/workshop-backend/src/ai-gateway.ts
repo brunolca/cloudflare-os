@@ -21,7 +21,7 @@ const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
  * (CF_AI_GATEWAY_PROVIDERS) may enable it -- an admin cannot add models or turn it on here.
  */
 const GATEWAY_PROVIDERS: ReadonlySet<string> =
-    new Set<AiModelProvider>(["anthropic", "openai", "google", "cloudflare"]);
+    new Set<AiModelProvider>(["anthropic", "openai", "google", "cloudflare", "cerebras"]);
 
 /** Throws unless AI Gateway serves `provider`. */
 export function assertGatewayProvider(provider: string): void {

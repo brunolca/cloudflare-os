@@ -36,6 +36,7 @@ type SelectionType =
 // Placeholder hinting at the shape of each provider's API token.
 const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   neuralwatt: 'Neuralwatt API key',
+  cerebras: 'csk-...',
   anthropic: 'sk-ant-...',
   openai: 'sk-...',
   google: 'AIza...',
