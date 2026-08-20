@@ -57,6 +57,7 @@ import {
 import { RpcStub, RpcTarget } from "capnweb";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import FlintChart from "./FlintChart";
 import styles from "./ChatInterface.module.css";
 import {
   getStoredSelectedModel,
@@ -1161,11 +1162,52 @@ function CodeBlock({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
   );
 }
 
+/** The fenced-code language an agent uses to emit a chart. See FlintChart. */
+const FLINT_CODE_CLASS = "language-flint";
+
+// The minimal shape of the hast nodes react-markdown hands components. Read from the node rather
+// than introspecting rendered React children, which would depend on how `code` was overridden.
+type HastNode = {
+  type: string;
+  tagName?: string;
+  value?: string;
+  properties?: {className?: unknown};
+  children?: HastNode[];
+};
+
+/**
+ * The chart source inside a ```flint block, or null for any other `pre`.
+ *
+ * Matched on `pre` rather than `code` so the chart replaces the whole block: a chart nested inside
+ * a `pre` would inherit its monospace, whitespace, and scroll behavior.
+ */
+function flintSourceFromPre(node: HastNode | undefined): string | null {
+  const code = node?.children?.find((child) => child.type === "element");
+  if (!code || code.tagName !== "code") return null;
+
+  const raw = code.properties?.className;
+  const classNames = Array.isArray(raw)
+    ? raw.map(String)
+    : typeof raw === "string" ? raw.split(/\s+/) : [];
+  if (!classNames.includes(FLINT_CODE_CLASS)) return null;
+
+  return (code.children ?? [])
+      .filter((child) => child.type === "text")
+      .map((child) => child.value ?? "")
+      .join("");
+}
+
 function getMarkdownComponents(
   mentionsByToken?: Map<string, Mention>,
 ): Components {
   return {
-    pre: ({ node: _node, ...props }) => <CodeBlock {...props} />,
+    pre: ({ node, children, ...props }) => {
+      const flintSource = flintSourceFromPre(node as HastNode | undefined);
+      if (flintSource !== null) {
+        return <FlintChart source={flintSource} />;
+      }
+      return <CodeBlock {...props}>{children}</CodeBlock>;
+    },
     table: ({ node: _node, children, ...props }) => (
       <div className={styles.markdownTableWrapper}>
         <table {...props}>{children}</table>

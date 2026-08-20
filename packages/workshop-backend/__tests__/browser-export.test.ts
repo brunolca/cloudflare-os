@@ -325,6 +325,21 @@ describe("renderGadgetInBrowser", () => {
     expect(harness.blobRequestContinued()).toBe(true);
   });
 
+  it("injects the platform stylesheet so exports match the interactive view", async () => {
+    let { stream, harness } = render();
+    await collect(await stream);
+
+    let document = harness.exportDocument();
+    // The token layer and a representative component class, i.e. the real stylesheet rather than
+    // an empty <style> element.
+    expect(document).toContain("--g-accent-seed");
+    expect(document).toContain(".g-btn");
+    // Exports render light: they get printed and shared.
+    expect(document).toContain('data-gadget-theme="light"');
+    // Print rules are what keep a PDF from being split mid-card or carrying on-screen chrome.
+    expect(document).toContain("@media print");
+  });
+
   it("exports an inert snapshot with locally bundled DOMPurify", async () => {
     let { stream, harness } = render(undefined, true, "text/html");
 

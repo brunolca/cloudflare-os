@@ -2,6 +2,11 @@ import { launch, type Page } from "@cloudflare/puppeteer";
 import { RpcSession, type RpcStub, type RpcTransport } from "capnweb";
 import { createLogger } from "@gadgets/observability/logger";
 import type { GadgetExportFormat } from "@gadgets/workshop-shared/api";
+import {
+  EXPORT_GADGET_THEME,
+  gadgetStyleTag,
+  gadgetThemeRootAttributes,
+} from "@gadgets/workshop-shared/gadget-theme";
 import BROWSER_EXPORT_RUNTIME from "./generated/browser-export-runtime.txt";
 import HTML_SANITIZER_RUNTIME from "./generated/html-sanitizer-runtime.txt";
 import {
@@ -134,6 +139,7 @@ function makeExportHtml(clientCode: string, formatId: string): string {
   let clientPrefix = String.raw`//# sourceURL=client.js
 const { gadget, RpcStub, RpcTarget } = globalThis.__workshopExportRuntime;
 delete globalThis.__workshopExportRuntime;
+globalThis.gadgetTheme = Object.freeze({mode: "light", accentColor: null});
 `;
   let clientUrl = scriptUrl(clientPrefix + clientCode);
   let runtimeUrl = scriptUrl(
@@ -141,10 +147,15 @@ delete globalThis.__workshopExportRuntime;
       `globalThis.__workshopExportClientUrl = ${JSON.stringify(clientUrl)};\n` +
       BROWSER_EXPORT_RUNTIME);
 
+  // The same platform stylesheet the interactive iframe injects, so an exported file looks like
+  // what the user saw rather than like unstyled HTML. Exports render light (see
+  // EXPORT_GADGET_THEME): they get printed and shared, and the stylesheet's `@media print` block
+  // additionally forces a light palette and drops on-screen-only chrome for PDF.
   return `<!DOCTYPE html>
-<html>
+<html ${gadgetThemeRootAttributes(EXPORT_GADGET_THEME)}>
 <head>
   <meta charset="utf-8">
+  ${gadgetStyleTag()}
 </head>
 <body>
   <script src="${runtimeUrl}"></script>

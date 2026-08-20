@@ -589,3 +589,63 @@ describe('GadgetUI no-UI placeholder reporting', () => {
     expect(onNoUiChange).not.toHaveBeenCalled()
   })
 })
+
+describe('GadgetUI styling and theming', () => {
+  let container: HTMLDivElement
+  let root: Root
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+  })
+
+  afterEach(async () => {
+    await act(async () => root.unmount())
+    container.remove()
+  })
+
+  async function renderGadget() {
+    const gadget = fakeGadget('value', 'document.body.textContent = "styled"')
+    await act(async () => {
+      root.render(<GadgetUI gadget={gadget.stub} height="100px" />)
+    })
+    await vi.waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    return container.querySelector('iframe')!
+  }
+
+  it('injects the platform stylesheet and theme into the sandboxed document', async () => {
+    const srcDoc = (await renderGadget()).getAttribute('srcdoc')!
+
+    expect(srcDoc).toContain('--g-accent-seed')
+    expect(srcDoc).toContain('.g-btn')
+    // Baked into the markup rather than applied after load, so the first paint is already correct.
+    expect(srcDoc).toContain('data-gadget-theme="light"')
+    expect(srcDoc).toContain('name="viewport"')
+    // A Gadget may embed a webfont; the platform stylesheet never does.
+    expect(srcDoc).toContain('font-src data:')
+  })
+
+  it('gives the Gadget a theme it can read and react to in JavaScript', async () => {
+    const srcDoc = (await renderGadget()).getAttribute('srcdoc')!
+
+    expect(srcDoc).toContain('gadgetTheme')
+    expect(srcDoc).toContain('gadgetthemechange')
+  })
+
+  it('pushes the theme over postMessage rather than rebuilding the document', async () => {
+    const iframe = await renderGadget()
+    const before = iframe.getAttribute('srcdoc')
+    const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage')
+
+    dispatchIframeHandshake(iframe, new MessageChannel().port2)
+
+    // Retheming a live frame must never touch srcDoc: changing it renavigates the iframe, which
+    // would cost the Gadget all of its in-page state every time the user flipped light/dark.
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalled())
+    expect(postMessage.mock.calls.some(([message]) =>
+      (message as {type?: string})?.type === 'gadget-theme')).toBe(true)
+    expect(iframe.getAttribute('srcdoc')).toBe(before)
+    expect(container.querySelector('iframe')).toBe(iframe)
+  })
+})

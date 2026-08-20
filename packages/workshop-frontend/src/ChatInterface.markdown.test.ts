@@ -60,3 +60,61 @@ describe("MarkdownMessage line breaks", () => {
     expect(writeText).toHaveBeenCalledWith("const answer = 42;");
   });
 });
+
+describe("MarkdownMessage flint chart blocks", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  afterEach(async () => {
+    if (root) await act(async () => root.unmount());
+    container?.remove();
+  });
+
+  async function render(message: string) {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root.render(createElement(MarkdownMessage, { message })));
+  }
+
+  const SPEC = JSON.stringify({
+    data: { values: [{ a: "x", b: 1 }] },
+    semantic_types: { a: "Category", b: "Count" },
+    chart_spec: { chartType: "Bar Chart", encodings: { x: { field: "a" }, y: { field: "b" } } },
+  }, null, 2);
+
+  // The chart replaces the whole <pre>: nesting a chart inside one would inherit its monospace,
+  // whitespace, and scrolling. jsdom has no layout, so the chart never renders here -- what this
+  // pins down is the routing, not the drawing.
+  it("routes a flint block away from <pre> and into the chart container", async () => {
+    await render("Here you go:\n\n```flint\n" + SPEC + "\n```\n");
+
+    expect(container.querySelector("pre")).toBeNull();
+    expect(container.querySelector('[role="img"]')).not.toBeNull();
+  });
+
+  it("leaves other fenced code blocks as <pre>", async () => {
+    await render("```js\nconst a = 1;\n```\n");
+
+    const pre = container.querySelector("pre");
+    expect(pre).not.toBeNull();
+    expect(pre!.textContent).toContain("const a = 1;");
+    expect(container.querySelector('[role="img"]')).toBeNull();
+  });
+
+  it("leaves an unlabelled fenced block as <pre>", async () => {
+    await render("```\n" + SPEC + "\n```\n");
+
+    expect(container.querySelector("pre")).not.toBeNull();
+    expect(container.querySelector('[role="img"]')).toBeNull();
+  });
+
+  // A malformed spec must degrade to something the user can still read and quote back, rather
+  // than throwing inside the message and taking the whole conversation down with it.
+  it("shows a readable fallback for a spec that is complete but wrong", async () => {
+    await render('```flint\n{"data": {"values": []}}\n```\n');
+
+    expect(container.textContent).toContain("data rows");
+    expect(container.querySelector("pre")).not.toBeNull();
+  });
+});

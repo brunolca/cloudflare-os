@@ -60,3 +60,14 @@ export function useTheme() {
   if (!context) throw new Error('useTheme must be used within ThemeProvider')
   return context
 }
+
+/**
+ * The theme if a provider is present, otherwise null.
+ *
+ * For consumers where appearance is a cosmetic input rather than a requirement, and refusing to
+ * render would be a worse outcome than falling back to the default palette -- notably GadgetUI,
+ * which must show the Gadget either way.
+ */
+export function useOptionalTheme(): ThemeContextValue | null {
+  return useContext(ThemeContext)
+}

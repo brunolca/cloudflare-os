@@ -2,7 +2,16 @@ import { useState, useEffect, useRef } from 'react'
 import { Text, Loader, Banner } from '@cloudflare/kumo'
 import { Sparkle } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget, newMessagePortRpcSession } from 'capnweb'
-import { GadgetClient, ConsoleLogEvent } from '@gadgets/workshop-shared/api'
+import { GadgetClient, ConsoleLogEvent, isHexColor } from '@gadgets/workshop-shared/api'
+import {
+  GADGET_THEME_MESSAGE,
+  gadgetStyleTag,
+  gadgetThemeRootAttributes,
+  normalizeGadgetTheme,
+  type GadgetTheme,
+} from '@gadgets/workshop-shared/gadget-theme'
+import { useOptionalTheme } from './ThemeContext'
+import { useServerConfig } from './ServerConfigContext'
 
 // We want to inject Cap'n Web into the Gadget. Luckily it has no dependencies, so we can just take
 // the whole module and embed it. We can import the module using ?raw to get a string of the
@@ -100,14 +109,62 @@ window.addEventListener('unhandledrejection', (event) => {
   }, '*');
 });
 
+// Expose the Workshop appearance the document was rendered with, and keep it current. Read back
+// out of the DOM rather than interpolated in, so this prefix stays a constant -- it carries the
+// whole Cap'n Web bundle, and re-encoding it on every theme change would be absurd.
+{
+  const root = document.documentElement;
+  const readTheme = () => Object.freeze({
+    mode: root.getAttribute('data-gadget-theme') === 'dark' ? 'dark' : 'light',
+    accentColor: root.style.getPropertyValue('--g-accent-seed').trim() || null,
+  });
+
+  globalThis.gadgetTheme = readTheme();
+
+  // Rethemes in place. Reloading the iframe instead would be visible and would cost the Gadget
+  // all of its in-page state every time the user flipped light/dark.
+  window.addEventListener('message', (event) => {
+    // Only the embedder may retheme. Any other frame that got a handle to this window is ignored.
+    if (event.source !== window.parent) return;
+    if (event.data?.type !== ${JSON.stringify(GADGET_THEME_MESSAGE)}) return;
+
+    const theme = event.data.theme;
+    if (theme?.mode !== 'light' && theme?.mode !== 'dark') return;
+    const accent = typeof theme.accentColor === 'string' &&
+        /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(theme.accentColor)
+      ? theme.accentColor
+      : null;
+
+    root.setAttribute('data-gadget-theme', theme.mode);
+    if (accent) {
+      root.style.setProperty('--g-accent-seed', accent);
+    } else {
+      root.style.removeProperty('--g-accent-seed');
+    }
+
+    globalThis.gadgetTheme = readTheme();
+    // Lets a Gadget re-render anything CSS cannot reach for it, e.g. a <canvas> or a chart whose
+    // colors were sampled in JS.
+    window.dispatchEvent(new CustomEvent('gadgetthemechange', {detail: globalThis.gadgetTheme}));
+  });
+}
+
 `);
 
-const createSandboxedHtml = (jsCode: string): string => {
+// `font-src data:` lets a Gadget embed a webfont it genuinely needs. The platform stylesheet never
+// uses one (see GADGET_STYLESHEET), and this matches the browser-export CSP so a Gadget that does
+// embed one renders the same on screen as in its exported file.
+const GADGET_CSP = "default-src 'none'; frame-src 'none'; script-src data: 'unsafe-inline'; " +
+  "style-src data: 'unsafe-inline'; img-src data:; media-src data:; font-src data:; " +
+  "object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none';"
+
+const createSandboxedHtml = (jsCode: string, theme: GadgetTheme): string => {
   return `<!DOCTYPE html>
-<html>
+<html ${gadgetThemeRootAttributes(theme)}>
 <head>
+  <meta http-equiv="Content-Security-Policy" content="${GADGET_CSP}">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src 'none'; script-src data: 'unsafe-inline'; style-src data: 'unsafe-inline'; img-src data:; media-src data:; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none';">
+  ${gadgetStyleTag()}
 </head>
 <body>
     <script type="module" src="data:text/javascript;charset=utf-8,${INJECTED_CODE_PREFIX}${encodeURIComponent(jsCode)}"></script>
@@ -180,6 +237,35 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
     onNoUiChangeRef.current?.(true)
     return () => onNoUiChangeRef.current?.(false)
   }, [showsNoUi])
+
+  // Workshop's resolved appearance, forwarded into the sandbox so a Gadget matches the app around
+  // it. Mirrors what SandboxedGatekeeperApp pushes to gatekeeper app frames.
+  const resolvedThemeMode = useOptionalTheme()?.resolvedThemeMode ?? 'light'
+  const configuredAccentColor = useServerConfig()?.accentColor
+  const theme = normalizeGadgetTheme({
+    mode: resolvedThemeMode,
+    accentColor: configuredAccentColor && isHexColor(configuredAccentColor)
+      ? configuredAccentColor
+      : null,
+  })
+  // Held in a ref, and deliberately not a dependency of the bundle-loading effect: the theme is
+  // baked into the srcDoc for a correct first paint, and changing srcDoc renavigates the iframe.
+  // Live theme changes go over postMessage instead (see below), which keeps Gadget state intact.
+  const themeRef = useRef(theme)
+  themeRef.current = theme
+
+  const postTheme = (nextTheme: GadgetTheme) => {
+    iframeRef.current?.contentWindow?.postMessage(
+      { type: GADGET_THEME_MESSAGE, theme: nextTheme },
+      // The sandboxed frame has an opaque origin, so '*' is the only targetOrigin that reaches it.
+      // Safe: the payload is the public appearance state, and the frame verifies the sender.
+      '*',
+    )
+  }
+
+  useEffect(() => {
+    postTheme({ mode: theme.mode, accentColor: theme.accentColor })
+  }, [theme.mode, theme.accentColor])
 
   const suspendGadgetCalls = () => {
     if (!pendingGadgetStubRef.current) {
@@ -308,7 +394,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
         const bundle = await gadget.getUiBundle(chatId)
         if (!isCurrent()) return
         if (bundle) {
-          const html = createSandboxedHtml(bundle.jsCode)
+          const html = createSandboxedHtml(bundle.jsCode, themeRef.current)
           setSandboxedHtml(html)
         } else {
           setSandboxedHtml(null)
@@ -352,6 +438,9 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
       }
 
       if (event.data === 'handshake' && event.ports && event.ports[0]) {
+        // Resend the current theme: the srcDoc was built when the bundle loaded, and the user may
+        // have flipped light/dark in the window between then and this frame actually running.
+        postTheme(themeRef.current)
         const port = event.ports[0]
         let gadgetStub: any = null
         resetConnection(new Error('Gadget iframe reloaded.'))
