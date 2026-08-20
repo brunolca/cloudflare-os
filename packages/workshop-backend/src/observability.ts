@@ -1,4 +1,5 @@
 import { createObservabilityContext } from "@gadgets/backend-utils/observability-context";
+import { createTracer } from "@gadgets/backend-utils/tracing";
 
 /** Observability fields emitted by the Workshop backend. */
 export type WorkshopObservabilityFields = {
@@ -8,12 +9,14 @@ export type WorkshopObservabilityFields = {
   blueprintId: string;
   callbackInitiated: boolean;
   chatId: number;
+  durableObjectId: string;
   durationMs: number;
   eventName: string;
   executionId: string;
   failureCount: number;
   gadgetId: string;
   gatekeeperId: number | string;
+  logBytes: number;
   modelId: string;
   observerId: string;
   operation: string;
@@ -37,3 +40,6 @@ export const obsContext = createObservabilityContext<WorkshopObservabilityFields
 export function createWorkshopLogger(component: string) {
   return obsContext.createLogger({ component });
 }
+
+/** Runs `callback` in a trace span carrying the ambient observability fields as attributes. */
+export const traced = createTracer(obsContext.get);

@@ -15,6 +15,9 @@ import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
 import { webFetch as webFetchImpl, WebFetchEnv, formatWebFetchResult } from "./web-fetch";
 import { AgentCatalogSnapshot, formatAlwaysAvailableResourcesPrompt } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
+import {
+  attributeChatMessage, formatChatIdentityPrompt, listChatParticipants,
+} from "./chat-identity";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
@@ -422,6 +425,50 @@ Both the client and server run inside a strictly isolated sandbox. They cannot m
 
 Note that the iframe sandbox on the client side prohibits modal popup boxes like alert() and confirm(), so do not use those.
 
+## Knowing who is connected
+
+By default a Gadget cannot tell its users apart: every client that opens it gets a stub to the same Durable Object. To learn who is connecting, define an optional \`onConnect(user)\` method on the Gadget class. The platform calls it once per connection and passes an identity it fills in itself:
+
+\`\`\`
+{
+  id: "kenton@cloudflare.com",   // stable; safe to use as a storage key
+  name: "Kenton Varda",          // display name; not unique, and it can change
+  role: "build",                 // "build" (full access) or "use" (may only use the UI)
+  isOwner: true,                 // whether this user owns the Gadget
+}
+\`\`\`
+
+This object is trustworthy: it comes from the session the platform already authenticated, not from client.js. Anything the client sends up through the \`gadget\` stub is NOT trustworthy — a collaborator can call any method on your Durable Object with any arguments they like, so never accept a claimed identity as a parameter.
+
+\`onConnect()\` can be used two ways:
+
+1. Return nothing, and just record who showed up. The client keeps talking to the main Durable Object, exactly as before. Use this for presence, attribution ("last edited by Alice"), or per-user state.
+
+2. Return an object, and that object becomes the client's \`gadget\` stub for the whole connection. Only the methods you expose on it are reachable. This is the only way to actually restrict what a user can do:
+
+\`\`\`
+import { DurableObject, RpcTarget } from "cloudflare:workers";
+
+export class Gadget extends DurableObject {
+  onConnect(user) {
+    return user.isOwner ? new AdminSession(this, user) : new ViewerSession(this, user);
+  }
+}
+
+class ViewerSession extends RpcTarget {
+  constructor(gadget, user) { super(); this.gadget = gadget; this.user = user; }
+  getItems() { return this.gadget.getItems(); }
+}
+
+class AdminSession extends ViewerSession {
+  deleteItem(id) { return this.gadget.deleteItem(id); }
+}
+\`\`\`
+
+Only implement \`onConnect()\` when the Gadget actually needs identity; a Gadget without one behaves exactly as it always has. Note that hiding a button in client.js is NOT an access control — if an action must be restricted, it has to be absent from the object \`onConnect()\` returned. If \`onConnect()\` throws, the connection fails; it does not fall back to unrestricted access.
+
+Not every caller is a session: the coding agent reaching a Gadget through a binding, PDF export, and hook delivery all talk to the main Durable Object directly and never trigger \`onConnect()\`. So do not treat \`onConnect()\` as the Gadget's only entry point.
+
 ## Server -> Client callbacks and subscriptions
 
 Note that Cap'n Web is a bidirectional object capability protocol, meaning, among other things, you can pass a function over RPC, in the params or results of another function. This actually passes the function "by reference": the receiving end actually receives an RPC stub, which can be used to call back over RPC to the original function. This, of course, causes the function to become async, even if the original was synchronous.
@@ -467,7 +514,7 @@ If you need \`RpcTarget\` in server.js, you can import it from "cloudflare:worke
 
 * ALWAYS store server state in Durable Object storage, not just in memory. Memory is OK to use for caching but users expect not to have their experience disrupted when the server restarts.
 * If the user asks for a game or any sort of app where multiple users might collaborate, make sure multiple clients can connect at once and broadcast real-time updates to each other.
-* Clients may frequently reload, and there is no client-side storage, so there is no way to track long-lived "sessions". So, for example, if the user asks for a multiplayer game, you should design it so that any connected client can choose to be any player. If it's turn-based, you can just let any client make any move. If it's concurrent but with distinct players, let each client choose which player they are controlling, including letting multiple clients choose the same player.
+* Clients may frequently reload, and there is no client-side storage, so there is no way to track long-lived "sessions" on the client. A Gadget that needs to know *who* a client is should define \`onConnect(user)\` (see "Knowing who is connected") rather than trying to keep client-side state. For a multiplayer game shared by several people, \`user.id\` is a good key to remember which player someone was across reloads. Absent that, design so any connected client can choose to be any player: if it's turn-based, let any client make any move; if it's concurrent but with distinct players, let each client choose which player they control, including letting multiple clients choose the same player.
 * If a Gadget contains a README.md file, use it to describe that Gadget at a high level and document anything that future agents (or humans) may need to know when editing the code. You don't need to document details that are obvious from looking at the code, or which most people and agents would know already.
 
 # Persistent Stubs and \`ctx.restore()\`
@@ -1379,6 +1426,13 @@ export async function runAgent(
   // callback holds) -- keep them in sync.
   let callbackNameCounter = 0;
 
+  // Who has written in this chat (see chat-identity.ts). With more than one participant, replay
+  // names the author of each of their messages below, and the system prompt says that it does.
+  // A second participant arriving invalidates the prompt cache once, since it retroactively
+  // attributes the messages already in the log -- worth it to keep the identities straight.
+  let participants = listChatParticipants(chatMessages);
+  let attributeAuthors = participants.length > 1;
+
   // Rebuild the code the compacted prefix left behind. Accepted and proposed updates are stored
   // separately so a later revert can drop only the proposed ones, but replay needs both.
   if (checkpoint?.acceptedChanges) applyReplayedChanges(checkpoint.acceptedChanges, false);
@@ -1448,6 +1502,10 @@ export async function runAgent(
         switch (msg.author.type) {
           case "user":
           case "gadget":
+            // Name the author when the chat has several participants, so a request stays attached
+            // to whoever made it -- otherwise the model reads the one identity in the system prompt
+            // (the current sender) as the author of everything before it too.
+            if (attributeAuthors) content = attributeChatMessage(content, msg.author);
             if (msg.attachments?.length) {
               let parts: (TextContent | ImageContent)[] = [];
               if (content) parts.push({type: "text", text: content});
@@ -2197,6 +2255,15 @@ export async function runAgent(
           `${systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
     ];
+  }
+
+  // Name the person (or Gadget) driving this turn. Appended to the dynamic slot, and last within
+  // it: it is the most volatile part of the prompt, since in a shared chat it follows whoever wrote
+  // the message being answered.
+  let identityPrompt = formatChatIdentityPrompt(
+      initiator, attributeAuthors ? participants : undefined);
+  if (identityPrompt) {
+    systemPromptSlots[1] = `${systemPromptSlots[1]}\n\n${identityPrompt}`;
   }
 
   let systemPrompt = `${systemPromptSlots[0]}\n\n${systemPromptSlots[1]}`;

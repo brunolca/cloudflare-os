@@ -12,7 +12,7 @@ import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.mode
 import { CLOUDFLARE_WORKERS_AI_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
-import { ApprovalQueue, Gatekeeper, ResourceDescription } from '@gadgets/workshop-shared/gatekeeper';
+import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
@@ -594,11 +594,34 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           name: config.model,
           api: "openai-completions",
           provider: "ollama",
-          baseUrl: `${(config.apiUrl ?? "http://localhost:11434")
-              .replace(/\/+$/, "").replace(/\/(api|v1)$/, "")}/v1`,
+          baseUrl: `${stripTrailingSlashes(config.apiUrl ?? "http://localhost:11434")
+              .replace(/\/(api|v1)$/, "")}/v1`,
           reasoning: true,
           input: ["text", "image"],
           cost: ZERO_COST,
+
+          // Pi's OpenAI compat uses the "developer" role for the system prompt by default,
+          // disabling it only for certain hostnames which are known not to support it.
+          //
+          // In ollama, some models support it and some do not. Frustratingly, the ones that do not
+          // don't necessarily throw an error. They may just proceed without a system prompt. For
+          // example, when I tested Muse Glimmer the day after it was released, I found it
+          // understood what tool calls were available to it but didn't know any of the info in
+          // the system prompt. Annoyingly, Muse Glimmer seems to be trained to treat the system
+          // prompt as secret, so refused to answer my questions about it directly. But I figured
+          // out it clearly wasn't getting the system prompt. And when I disabled  the "developer"
+          // role, the problem was fixed. In contrast, though, Gemma 4 running under otherwise
+          // exactly the same setup does understand the "developer" role and works fine. Weird!
+          //
+          // Some users also filed issues about this because they were trying to use the ollama
+          // provider as a way to target an arbitrary third-party OpenAI-compatible provider. This
+          // is not the intended use case for the ollama provider -- we should add an explicit
+          // provider for this. The ollama provider could in the future switch to using the ollama
+          // native API rather than the OpenAI-compatible endpoint, which would break users using
+          // it in this way. That said, if this flag works as a temporary work-around for them
+          // util we add a real OpenAI provider option... great.
+          compat: catalog?.compat ?? {supportsDeveloperRole: false},
+
           ...window,
         },
         ...(config.apiToken === ""

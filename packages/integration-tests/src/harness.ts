@@ -96,8 +96,9 @@ function workshopConfig(
   // No CF_ACCESS_AUD, so /api takes the unauthenticated path and password signup is available.
   config.vars = { ...config.vars, ADMINS: [ADMIN_USERNAME] };
 
-  // Gadget code is never executed here (a gatekeeper is in observer scope purely by having a
-  // vendorId), so drop the Worker Loader rather than requiring it to start.
+  // Most suites never execute gadget code (a gatekeeper is in observer scope purely by having a
+  // vendorId), so drop the Worker Loader rather than requiring it to start. A suite that does run
+  // gadget code puts it back via `patchWorkshop` -- see __tests__/gadget-connect.test.ts.
   delete config.worker_loaders;
 
   patch?.(config);
