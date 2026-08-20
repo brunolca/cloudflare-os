@@ -12,6 +12,20 @@ import { GoogleSheetsApi } from "./sheets-api";
 import type {
   GoogleSpreadsheetSession, SpreadsheetInfo, SpreadsheetRange, SpreadsheetValueMode,
 } from "./sheets-types";
+import {
+  DrivePage, GOOGLE_DOC_MIME_TYPE, GoogleDriveApi, isOcrConvertible, MAX_BINARY_BYTES,
+  MAX_TEXT_BYTES, parentGroups, textSourceFor,
+} from "./drive-api";
+import {
+  buildDriveOverlay, createdSyntheticId, DriveIdMap, DrivePendingContentStore, isSyntheticId,
+  matchesDriveFilter, overlayFolderChildren, overlayItemInfo, pendingItemInfo, pendingSearchMatches,
+  referencedIds, syntheticId, SYNTHETIC_ID_PREFIX,
+} from "./drive-actions";
+import type { DriveAction, DriveOverlay } from "./drive-actions";
+import type {
+  DriveEntry, DriveFile, DriveFileSession, DriveFolder, DriveFolderSession, DriveItemInfo,
+  DriveListOptions, DriveSearchFilter, DriveSession, DriveSharingEntry, DriveTextContent,
+} from "./drive-types";
 import { docToMarkdown, markdownToDocRequests, computeReplaceOperations, DocSnapshot } from "./markdown-converter";
 import { BigQueryApi, DEFAULT_MAX_BYTES_BILLED } from "./bigquery-api";
 import {
@@ -29,18 +43,21 @@ import type {
 } from "./calendar-types";
 import TYPES_CODE from "./types.txt";
 import DOCS_TYPES_CODE from "./docs-types.txt";
+import DRIVE_TYPES_CODE from "./drive-types.txt";
 import BIGQUERY_TYPES_CODE from "./bigquery-types.txt";
 import CALENDAR_TYPES_CODE from "./calendar-types.txt";
 import SHEETS_TYPES_CODE from "./sheets-types.txt";
 import {
   BigQueryConfiguratorUI,
   CalendarConfiguratorUI,
+  DriveConfiguratorUI,
   GmailConfiguratorUI,
   GoogleDocConfiguratorUI,
   GoogleSheetsConfiguratorUI,
 } from "./google-configurators";
 import BIGQUERY_CONFIGURATOR_HTML from "./generated/bigquery-configurator-ui.txt";
 import CALENDAR_CONFIGURATOR_HTML from "./generated/calendar-configurator-ui.txt";
+import DRIVE_CONFIGURATOR_HTML from "./generated/drive-configurator-ui.txt";
 import GMAIL_CONFIGURATOR_HTML from "./generated/gmail-configurator-ui.txt";
 import GOOGLE_DOC_CONFIGURATOR_HTML from "./generated/google-doc-configurator-ui.txt";
 import GOOGLE_SHEETS_CONFIGURATOR_HTML from "./generated/google-sheets-configurator-ui.txt";
@@ -254,6 +271,16 @@ const GOOGLE_CALENDAR_RESOURCE: SupportedResource = {
   grantable: true,
 };
 
+const DRIVE_HOST = "drive.google.com";
+
+const GOOGLE_DRIVE_RESOURCE: SupportedResource = {
+  urlPattern: `https://${DRIVE_HOST}/*`,
+  title: "Google Drive",
+  description:
+      "Browse and read files, either across My Drive or narrowed to one folder or file.",
+  grantable: true,
+};
+
 const BIGQUERY_RESOURCE: SupportedResource = {
   urlPattern: `https://${BIGQUERY_HOST}/:projectId/*`,
   title: "BigQuery",
@@ -299,6 +326,16 @@ const RESOURCE_SCOPES: {resource: SupportedResource, scopes: string[]}[] = [
       // Read-only calendar list, used to power the calendar picker when connecting a calendar.
       "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
       "https://www.googleapis.com/auth/calendar.events",
+    ],
+  },
+  {
+    resource: GOOGLE_DRIVE_RESOURCE,
+    scopes: [
+      // `drive` (not `drive.readonly`): the write half of the Drive API lands in a follow-up, and
+      // a scope expansion would force every connected account through a fresh consent. Read-only
+      // is enforced at the API layer meanwhile — the sessions expose no mutating method and the
+      // gatekeeper submits no actions. Same shape as the BigQuery entry below.
+      "https://www.googleapis.com/auth/drive",
     ],
   },
   {
@@ -479,6 +516,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   async getTypeScriptTypes(): Promise<string> {
     return [
       TYPES_CODE, DOCS_TYPES_CODE, SHEETS_TYPES_CODE, CALENDAR_TYPES_CODE, BIGQUERY_TYPES_CODE,
+      DRIVE_TYPES_CODE,
     ].join("\n");
   }
 }
@@ -933,6 +971,35 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       };
     }
 
+    if (parsed.hostname === DRIVE_HOST) {
+      let scope = parseDriveResourceUrl(parsed);
+      if (scope.kind === "folder") {
+        let props: DriveFolderGatekeeperImplProps = {
+          userObjectId: this.ctx.props.userObjectId,
+          folderId: scope.folderId,
+        };
+        return {
+          class: this.ctx.exports.DriveFolderGatekeeperImpl({props}),
+          resource: GOOGLE_DRIVE_RESOURCE,
+        };
+      }
+      if (scope.kind === "file") {
+        let props: DriveFileGatekeeperImplProps = {
+          userObjectId: this.ctx.props.userObjectId,
+          fileId: scope.fileId,
+        };
+        return {
+          class: this.ctx.exports.DriveFileGatekeeperImpl({props}),
+          resource: GOOGLE_DRIVE_RESOURCE,
+        };
+      }
+      let props: DriveGatekeeperImplProps = { userObjectId: this.ctx.props.userObjectId };
+      return {
+        class: this.ctx.exports.DriveGatekeeperImpl({props}),
+        resource: GOOGLE_DRIVE_RESOURCE,
+      };
+    }
+
     // Default: Gmail
     let props: GmailGatekeeperImplProps = {...this.ctx.props};
 
@@ -980,6 +1047,13 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       return {
         iframeHtml: GMAIL_CONFIGURATOR_HTML,
         ui: new RpcStub(new GmailConfiguratorUI()),
+      };
+    }
+
+    if (resourceUrlPattern === GOOGLE_DRIVE_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: DRIVE_CONFIGURATOR_HTML,
+        ui: new RpcStub(new DriveConfiguratorUI(getToken)),
       };
     }
 
@@ -1060,6 +1134,12 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 // Google spans several strategies (see each gatekeeper's observer methods):
 //   - Gmail Mailbox — strategy A (private-only): addObserver always throws, so the verifier is never
 //     consulted (but must exist).
+//   - Google Drive (whole My Drive) — strategy A (private-only): a personal Drive spans everything
+//     the account owns, so the binding is never shareable and the verifier is not consulted.
+//   - Google Drive (folder / file) — strategy B (ACL check, single unit): hasDriveItemAccess answers
+//     whether the observer's own token can open the bound item. Sound for a folder because Drive
+//     permissions propagate downward and a descendant cannot be shared more narrowly than its
+//     parent, so folder access implies access to everything the binding can read.
 //   - Google Doc — strategy B (ACL check, single unit): hasDocAccess answers whether the observer's
 //     own token can open the bound document (Docs API returns 401/403/404 otherwise).
 //   - Google Sheets — strategy B (ACL check, single unit): hasSpreadsheetAccess answers whether the
@@ -1094,6 +1174,7 @@ function isNoAccessStatus(status: number | undefined): boolean {
  * part of the generic GatekeeperUserVerifier contract.
  */
 export interface GoogleVerifierApi extends GatekeeperUserVerifier {
+  hasDriveItemAccess(fileId: string): Promise<boolean>;
   hasDocAccess(documentId: string): Promise<boolean>;
   hasSpreadsheetAccess(spreadsheetId: string): Promise<boolean>;
   hasCalendarWriterAccess(calendarId: string): Promise<boolean>;
@@ -1116,6 +1197,17 @@ export class GoogleVerifier extends WorkerEntrypoint<Env, GoogleVerifierProps>
     let account = this.ctx.exports.UserAccount.get(
       this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
     return (await account.getAccessToken(opts)).token;
+  }
+
+  async hasDriveItemAccess(fileId: string): Promise<boolean> {
+    let api = new GoogleDriveApi(opts => this.#getToken(opts));
+    try {
+      await api.getFile(fileId);
+      return true;
+    } catch (error) {
+      if (isNoAccessStatus(httpStatusFromError(error))) return false;
+      throw error;
+    }
   }
 
   async hasDocAccess(documentId: string): Promise<boolean> {
@@ -3775,4 +3867,1759 @@ class BigQuerySessionImpl extends RpcTarget implements BigQuerySession {
     });
     return result;
   }
+}
+
+// =======================================================================================
+// Google Drive Gatekeeper
+//
+// Three bindings share one resource pattern, chosen by the Drive URL the user connects: the whole
+// My Drive, one folder and its subtree, or one file.
+//
+// Scope containment: a folder binding only hands out capabilities for items it reached by listing or
+// searching its own subtree, so a descendant capability cannot name something outside it. Two paths
+// can name an arbitrary item, and both are checked against the scope explicitly — a shortcut's
+// target (resolveShortcutTarget) and a move/copy destination (resolveDriveDestination).
+//
+// Writes go through the approval queue: every mutating method submits an action and performs
+// nothing, and drive-actions.ts simulates the pending change so later reads in the same session
+// observe it. A creation is addressed by a synthetic ID until its action is applied, which is what
+// lets "make Receipts/2026, then upload into it" run in one pass ahead of any approval.
+// =======================================================================================
+
+const MAX_DRIVE_PATH_SEGMENTS = 20;
+const MAX_DRIVE_NAME_LENGTH = 255;
+// A filtered Drive query can legitimately return empty pages; bound how many we skip before
+// concluding something is wrong, rather than paging forever.
+const MAX_EMPTY_DRIVE_PAGES = 20;
+// Applied actions keep a revert record. Bound how many we retain so storage cannot grow forever.
+const MAX_DRIVE_REVERT_RECORDS = 500;
+
+// All Drive mutations are grouped under one action kind, so a user who trusts this connection to
+// file documents does not have to approve six different tags.
+const DRIVE_CHANGE_ACTION: ActionKind = {
+  tag: "driveChange",
+  label: "Drive file changes",
+};
+
+type DriveResourceScope =
+  | { kind: "drive" }
+  | { kind: "folder"; folderId: string }
+  | { kind: "file"; fileId: string };
+
+// Normalize a Drive path, dropping the leading "drive" segment and the /u/<n>/ account prefix that
+// Drive's UI adds when several accounts are signed in.
+function driveUrlSegments(parsed: URL): string[] {
+  let segments = parsed.pathname.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean)
+      .map(segment => decodeURIComponent(segment));
+  if (segments[0] === "drive") segments.shift();
+  if (segments[0] === "u" && /^\d+$/.test(segments[1] ?? "")) segments.splice(0, 2);
+  return segments;
+}
+
+// Map a connected drive.google.com URL to the granularity it selects.
+function parseDriveResourceUrl(parsed: URL): DriveResourceScope {
+  if (parsed.protocol !== "https:") {
+    throw new Error(`Google Drive resource URLs must use https: ${parsed.href}`);
+  }
+  let segments = driveUrlSegments(parsed);
+
+  if (segments[0] === "folders") {
+    let folderId = segments[1];
+    if (!folderId) throw new Error("Invalid Google Drive folder URL: no folder ID found.");
+    return { kind: "folder", folderId };
+  }
+  if (segments[0] === "file" && segments[1] === "d") {
+    let fileId = segments[2];
+    if (!fileId) throw new Error("Invalid Google Drive file URL: no file ID found.");
+    return { kind: "file", fileId };
+  }
+  if (segments.length === 0 || segments[0] === "my-drive" || segments[0] === "home") {
+    return { kind: "drive" };
+  }
+  throw new Error(
+    "Unsupported Google Drive URL. Connect My Drive (https://drive.google.com/drive/my-drive), a " +
+    "folder (https://drive.google.com/drive/folders/<id>), or a file " +
+    "(https://drive.google.com/file/d/<id>).");
+}
+
+const DOCS_EDITOR_PATH_PREFIXES =
+    new Set(["document", "spreadsheets", "presentation", "drawings", "forms"]);
+
+// Extract a Drive file ID from any URL that names one: a Drive file/folder link, a Drive `?id=`
+// link, or a Google editor link on docs.google.com. Returns undefined if the URL names none.
+function driveItemIdFromUrl(url: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return undefined;
+  }
+  if (parsed.protocol !== "https:") return undefined;
+
+  if (parsed.hostname === DRIVE_HOST) {
+    let queryId = parsed.searchParams.get("id");
+    if (queryId) return queryId;
+    let segments = driveUrlSegments(parsed);
+    if (segments[0] === "folders" && segments[1]) return segments[1];
+    if (segments[0] === "file" && segments[1] === "d" && segments[2]) return segments[2];
+    return undefined;
+  }
+
+  if (parsed.hostname === "docs.google.com") {
+    let segments = parsed.pathname.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean)
+        .map(segment => decodeURIComponent(segment));
+    if (segments[0] === "u" && /^\d+$/.test(segments[1] ?? "")) segments.splice(0, 2);
+    if (DOCS_EDITOR_PATH_PREFIXES.has(segments[0] ?? "") && segments[1] === "d" && segments[2]) {
+      return segments[2];
+    }
+  }
+
+  return undefined;
+}
+
+type DriveSessionContext = {
+  api: GoogleDriveApi;
+  approvalQueue: RpcStub<ApprovalQueue>;
+  // Folder that bounds this binding, or undefined when the whole Drive is connected.
+  scopeFolderId: string | undefined;
+  pending: PendingActionStore<DriveAction>;
+  idMap: DriveIdMap;
+  content: DrivePendingContentStore;
+};
+
+function driveContentKey(actionId: number): string {
+  return `drive:content:${actionId}`;
+}
+
+function driveOverlay(ctx: DriveSessionContext): DriveOverlay {
+  return buildDriveOverlay(ctx.pending.list());
+}
+
+// The Drive ID to use against the API, or undefined while the item is still a pending creation.
+function driveRealId(ctx: DriveSessionContext, id: string): string | undefined {
+  let resolved = ctx.idMap.tryResolve(id);
+  return isSyntheticId(resolved) ? undefined : resolved;
+}
+
+// ISO 639-1: two letters, optionally with a region subtag Google also accepts (e.g. "zh-CN").
+function checkOcrLanguage(language: string): string {
+  if (typeof language !== "string" || !/^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(language)) {
+    throw new Error(
+      `Invalid OCR language "${language}". Use an ISO 639-1 code such as "en" or "fr".`);
+  }
+  return language;
+}
+
+function checkDriveName(name: string, what: string): string {
+  if (typeof name !== "string") throw new Error(`A ${what} name must be a string.`);
+  let trimmed = name.trim();
+  if (trimmed === "") throw new Error(`A ${what} name cannot be empty.`);
+  if (trimmed.length > MAX_DRIVE_NAME_LENGTH) {
+    throw new Error(`A ${what} name must be at most ${MAX_DRIVE_NAME_LENGTH} characters.`);
+  }
+  if (trimmed.includes("/")) {
+    throw new Error(
+      `A ${what} name cannot contain "/", because paths are separated by it. Use ` +
+      "ensureFolderPath() to create nested folders.");
+  }
+  return trimmed;
+}
+
+function driveContentBytes(
+  content: string | ArrayBuffer,
+  mimeType: string | undefined,
+): { bytes: Uint8Array; mimeType: string } {
+  let result = typeof content === "string"
+      ? { bytes: new TextEncoder().encode(content), mimeType: mimeType ?? "text/plain" }
+      : content instanceof ArrayBuffer
+        ? { bytes: new Uint8Array(content), mimeType: mimeType ?? "application/octet-stream" }
+        : undefined;
+  if (result === undefined) {
+    throw new Error("Content must be a string or an ArrayBuffer.");
+  }
+  if (result.bytes.byteLength > MAX_BINARY_BYTES) {
+    throw new Error(
+      `Content is ${result.bytes.byteLength.toLocaleString()} bytes, over the ` +
+      `${MAX_BINARY_BYTES.toLocaleString()}-byte write limit.`);
+  }
+  return result;
+}
+
+/**
+ * Stage an action and submit it for approval.
+ *
+ * The action ID is assigned by the store, but a creation's synthetic ID is derived from it, so the
+ * record is written twice: once to reserve the ID, then again with the ID-dependent fields filled
+ * in. `make` must therefore be pure.
+ */
+async function submitDriveAction(
+  ctx: DriveSessionContext,
+  make: (actionId: number) => DriveAction,
+  describe: (action: DriveAction) => { title: string; description: string; implementsRevert: boolean },
+  content?: Uint8Array,
+): Promise<number> {
+  let actionId = ctx.pending.submit(make(0));
+  let action = make(actionId);
+  ctx.pending.put(actionId, action);
+  if (content !== undefined) ctx.content.put(driveContentKey(actionId), content);
+
+  let described = describe(action);
+  try {
+    await ctx.approvalQueue.submitAction(actionId, {
+      title: described.title,
+      description: described.description,
+      implementsRevert: described.implementsRevert,
+      actionKind: DRIVE_CHANGE_ACTION,
+    });
+  } catch (error) {
+    ctx.pending.remove(actionId);
+    if (content !== undefined) ctx.content.delete(driveContentKey(actionId));
+    throw error;
+  }
+  return actionId;
+}
+
+/**
+ * Resolve a destination folder passed as a capability to an ID this binding is allowed to write to.
+ *
+ * The capability itself is not proof of scope: a gadget holding two Drive bindings could pass the
+ * other binding's folder, which would move a file out from under this binding's grant. So the
+ * destination is always checked against the connected scope.
+ */
+async function resolveDriveDestination(
+  ctx: DriveSessionContext,
+  destination: DriveFolder,
+): Promise<string> {
+  let info = await destination.getMetadata();
+  if (info.kind !== "folder") {
+    throw new Error(`"${info.name}" is not a folder, so it cannot be a destination.`);
+  }
+  let destinationId = info.id;
+
+  // Walk a pending destination up to its nearest committed ancestor: that is the folder whose
+  // position in the tree we can actually verify.
+  let overlay = driveOverlay(ctx);
+  let anchor = destinationId;
+  for (let hops = 0; isSyntheticId(anchor) && hops <= MAX_DRIVE_PATH_SEGMENTS; hops++) {
+    let resolved = ctx.idMap.tryResolve(anchor);
+    if (!isSyntheticId(resolved)) {
+      anchor = resolved;
+      break;
+    }
+    let item = overlay.created.get(anchor);
+    if (item === undefined) {
+      throw new Error(
+        "That destination folder no longer exists, because the change that would have created it " +
+        "was rejected.");
+    }
+    anchor = item.parentId;
+  }
+  if (isSyntheticId(anchor)) {
+    throw new Error("Could not determine where that destination folder will live.");
+  }
+
+  if (ctx.scopeFolderId !== undefined &&
+      !(await ctx.api.isWithinFolder(anchor, ctx.scopeFolderId))) {
+    throw new Error(
+      "That destination is outside the folder this connection is scoped to, so moving there " +
+      "would take the item out of the granted scope.");
+  }
+  // getFile() rejects shared drives and shared-with-me items, which is the whole-Drive check.
+  await ctx.api.getFile(anchor);
+
+  return destinationId;
+}
+
+// Build the capability for one item. A shortcut resolves to its target only when the target is
+// inside the connected scope; otherwise the entry carries metadata alone.
+async function toDriveEntry(ctx: DriveSessionContext, info: DriveItemInfo): Promise<DriveEntry> {
+  if (info.kind === "folder") {
+    return { kind: "folder", info, folder: new DriveFolderImpl(ctx, info.id) };
+  }
+  if (info.kind === "shortcut") {
+    let target = info.shortcutTargetId === undefined
+        ? undefined
+        : await resolveShortcutTarget(ctx, info.shortcutTargetId);
+    return { kind: "shortcut", info, ...(target ? { target } : {}) };
+  }
+  return { kind: "file", info, file: new DriveFileImpl(ctx, info.id) };
+}
+
+async function resolveShortcutTarget(
+    ctx: DriveSessionContext, targetId: string): Promise<DriveFile | DriveFolder | undefined> {
+  try {
+    // getFile() already rejects shared drives and shared-with-me items, which covers the
+    // whole-Drive binding; a folder binding additionally needs the ancestry check.
+    let record = await ctx.api.getFile(targetId);
+    if (ctx.scopeFolderId !== undefined &&
+        !(await ctx.api.isWithinFolder(record.info.id, ctx.scopeFolderId))) {
+      return undefined;
+    }
+    return record.info.kind === "folder"
+        ? new DriveFolderImpl(ctx, record.info.id)
+        : new DriveFileImpl(ctx, record.info.id);
+  } catch {
+    // A dangling or inaccessible shortcut is not an error for the listing that contains it.
+    return undefined;
+  }
+}
+
+type DriveCursorSource =
+  | { kind: "children"; folderId: string; options: DriveListOptions | undefined }
+  // `groups` restricts each query to direct children of one batch of folders; undefined searches
+  // the whole Drive.
+  | { kind: "search"; filter: DriveSearchFilter | undefined; groups: string[][] | undefined };
+
+@validateRpc()
+class DriveEntryCursorImpl extends RpcTarget implements Cursor<DriveEntry> {
+  #ctx: DriveSessionContext;
+  #source: DriveCursorSource;
+  #pageToken: string | undefined;
+  #groupIndex = 0;
+  #exhausted = false;
+  #tail: Promise<void> = Promise.resolve();
+  // Pending creations already emitted, so a multi-page listing does not repeat them.
+  #listedPending = new Set<string>();
+
+  constructor(ctx: DriveSessionContext, source: DriveCursorSource) {
+    super();
+    this.#ctx = ctx;
+    this.#source = source;
+  }
+
+  next(): Promise<DriveEntry[] | null> {
+    // Serialize concurrent next() calls so page tokens advance exactly once per page.
+    let result = this.#tail.then(() => this.#nextPage());
+    this.#tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  async #nextPage(): Promise<DriveEntry[] | null> {
+    if (this.#exhausted) return null;
+
+    let infos: DriveItemInfo[] = [];
+    let emptyPages = 0;
+    while (infos.length === 0) {
+      let overlay = driveOverlay(this.#ctx);
+      let page = await this.#requestPage(overlay);
+      if (page === null) {
+        this.#exhausted = true;
+        return null;
+      }
+      infos = page;
+      if (infos.length === 0 && ++emptyPages >= MAX_EMPTY_DRIVE_PAGES) {
+        throw new Error("Google Drive returned too many empty pages.");
+      }
+    }
+
+    let entries: DriveEntry[] = [];
+    for (let info of infos) {
+      entries.push(await toDriveEntry(this.#ctx, info));
+    }
+
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: `Read ${entries.length} Google Drive item(s)`,
+      description:
+        "Listed a page of Google Drive items.\n\n" +
+        formatApprovalField("Names", entries.map(entry => entry.info.name).join("\n")),
+    });
+
+    return entries;
+  }
+
+  // One page merged with pending state, or null once every group is exhausted.
+  async #requestPage(overlay: DriveOverlay): Promise<DriveItemInfo[] | null> {
+    let source = this.#source;
+
+    if (source.kind === "children") {
+      let realId = driveRealId(this.#ctx, source.folderId);
+      if (realId === undefined) {
+        // A folder that is itself still pending has no remote children — only pending ones.
+        if (this.#groupIndex > 0) return null;
+        this.#groupIndex++;
+        return overlayFolderChildren(source.folderId, [], overlay, {
+          ...(source.options?.includeTrashed !== undefined
+            ? { includeTrashed: source.options.includeTrashed }
+            : {}),
+          alreadyListed: this.#listedPending,
+          isLastPage: true,
+        });
+      }
+
+      if (this.#groupIndex > 0) return null;
+      let page = await this.#ctx.api.listChildren(realId, source.options, this.#pageToken);
+      this.#advance(page);
+      return overlayFolderChildren(realId, page.files, overlay, {
+        ...(source.options?.includeTrashed !== undefined
+          ? { includeTrashed: source.options.includeTrashed }
+          : {}),
+        alreadyListed: this.#listedPending,
+        isLastPage: this.#groupIndex > 0,
+      });
+    }
+
+    let parentIds = source.groups?.[this.#groupIndex];
+    if (source.groups !== undefined && parentIds === undefined) return null;
+    if (source.groups === undefined && this.#groupIndex > 0) return null;
+
+    let page = await this.#ctx.api.search(source.filter, parentIds, this.#pageToken);
+    this.#advance(page);
+    let isLastPage = source.groups === undefined
+        ? this.#groupIndex > 0
+        : this.#groupIndex >= source.groups.length;
+
+    let results = this.#overlaySearchPage(page, overlay, source.filter, source.groups);
+    if (isLastPage) {
+      // Pending creations have no page token of their own, so they join the final page.
+      let searchParents = source.groups === undefined
+          ? undefined
+          : source.groups.flat();
+      results.push(...pendingSearchMatches(
+          overlay, searchParents, source.filter, this.#listedPending));
+    }
+    return results;
+  }
+
+  // Re-evaluate remote hits against pending state: a rename may have made a match stop matching,
+  // and a move or trash may have taken it out of the searched scope.
+  #overlaySearchPage(
+    page: DrivePage,
+    overlay: DriveOverlay,
+    filter: DriveSearchFilter | undefined,
+    groups: string[][] | undefined,
+  ): DriveItemInfo[] {
+    let searchParents = groups?.flat();
+    let results: DriveItemInfo[] = [];
+    for (let record of page.files) {
+      let patch = overlay.patches.get(record.info.id);
+      let info = overlayItemInfo(record.info, overlay);
+      if (patch === undefined) {
+        results.push(info);
+        continue;
+      }
+      if (!matchesDriveFilter(info, filter)) continue;
+      let parentId = patch.parentId ?? record.parents[0];
+      if (searchParents !== undefined && parentId !== undefined &&
+          !searchParents.includes(parentId)) {
+        continue;
+      }
+      results.push(info);
+    }
+    return results;
+  }
+
+  #advance(page: DrivePage): void {
+    if (page.nextPageToken !== undefined) {
+      if (page.nextPageToken === this.#pageToken) {
+        throw new Error("Google Drive returned a repeated page token.");
+      }
+      this.#pageToken = page.nextPageToken;
+    } else {
+      this.#pageToken = undefined;
+      this.#groupIndex++;
+    }
+  }
+}
+
+const DRIVE_PENDING_GONE_MESSAGE =
+  "This Drive item no longer exists, because the change that would have created it was rejected.";
+
+@validateRpc()
+class DriveFolderImpl extends RpcTarget implements DriveFolderSession {
+  #ctx: DriveSessionContext;
+  #folderId: string;
+  // Only the session root owns the approval queue stub; sub-capabilities share it.
+  #ownsQueue: boolean;
+
+  constructor(ctx: DriveSessionContext, folderId: string, ownsQueue = false) {
+    super();
+    this.#ctx = ctx;
+    this.#folderId = folderId;
+    this.#ownsQueue = ownsQueue;
+  }
+
+  [Symbol.dispose](): void {
+    if (this.#ownsQueue) this.#ctx.approvalQueue[Symbol.dispose]();
+  }
+
+  async #info(overlay: DriveOverlay): Promise<DriveItemInfo> {
+    let realId = driveRealId(this.#ctx, this.#folderId);
+    if (realId === undefined) {
+      let item = overlay.created.get(this.#folderId);
+      if (item === undefined) throw new Error(DRIVE_PENDING_GONE_MESSAGE);
+      return pendingItemInfo(item);
+    }
+    return overlayItemInfo((await this.#ctx.api.getFile(realId)).info, overlay);
+  }
+
+  async getMetadata(): Promise<DriveItemInfo> {
+    let info = await this.#info(driveOverlay(this.#ctx));
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: "Read Google Drive folder metadata",
+      description:
+        "Read metadata for a Google Drive folder.\n\n" + formatApprovalField("Folder", info.name),
+    });
+    return info;
+  }
+
+  async list(options?: DriveListOptions): Promise<Cursor<DriveEntry>> {
+    return new DriveEntryCursorImpl(this.#ctx, {
+      kind: "children", folderId: this.#folderId, options,
+    });
+  }
+
+  async search(filter?: DriveSearchFilter): Promise<Cursor<DriveEntry>> {
+    let realId = driveRealId(this.#ctx, this.#folderId);
+    if (realId === undefined) {
+      // Nothing remote to search under a folder that does not exist yet; pending children only.
+      return new DriveEntryCursorImpl(this.#ctx, {
+        kind: "children", folderId: this.#folderId, options: undefined,
+      });
+    }
+    // Drive's `in parents` matches direct children only, so a recursive search enumerates the
+    // subtree's folders up front and queries them in batches.
+    let groups = filter?.recursive
+        ? parentGroups(await this.#ctx.api.collectSubtreeFolderIds(realId))
+        : [[realId]];
+    return new DriveEntryCursorImpl(this.#ctx, { kind: "search", filter, groups });
+  }
+
+  // Child folders of `parentId` named `name`, merging pending creations with Drive's own.
+  async #findChildFolders(
+    parentId: string,
+    name: string,
+    overlay: DriveOverlay,
+  ): Promise<string[]> {
+    let matches: string[] = [];
+    for (let item of overlay.created.values()) {
+      if (item.isFolder && !item.trashed && item.parentId === parentId && item.name === name) {
+        matches.push(item.id);
+      }
+    }
+
+    let realParent = driveRealId(this.#ctx, parentId);
+    if (realParent === undefined) return matches;
+
+    for (let record of await this.#ctx.api.findChildFoldersByName(realParent, name)) {
+      let info = overlayItemInfo(record.info, overlay);
+      // Skip anything a pending change renamed, trashed, or moved out of this folder.
+      if (info.trashed || info.name !== name) continue;
+      let currentParent = overlay.patches.get(record.info.id)?.parentId ?? record.parents[0];
+      if (currentParent !== undefined && currentParent !== realParent) continue;
+      matches.push(record.info.id);
+    }
+    return matches;
+  }
+
+  #pathSegments(path: string): string[] {
+    let segments = path.split("/").map(segment => segment.trim()).filter(segment => segment !== "");
+    if (segments.length === 0) {
+      throw new Error("A folder path must contain at least one folder name.");
+    }
+    if (segments.length > MAX_DRIVE_PATH_SEGMENTS) {
+      throw new Error(`A folder path may contain at most ${MAX_DRIVE_PATH_SEGMENTS} segments.`);
+    }
+    return segments;
+  }
+
+  async folderByPath(path: string): Promise<DriveFolder | null> {
+    let segments = this.#pathSegments(path);
+    let overlay = driveOverlay(this.#ctx);
+    let currentId = this.#folderId;
+
+    for (let segment of segments) {
+      let matches = await this.#findChildFolders(currentId, segment, overlay);
+      if (matches.length === 0) {
+        await this.#ctx.approvalQueue.authorizeObservation({
+          title: "Resolve a Google Drive folder path",
+          description:
+            "Looked up a folder path in Google Drive; it does not exist.\n\n" +
+            formatApprovalField("Path", segments.join("/")),
+        });
+        return null;
+      }
+      if (matches.length > 1) {
+        throw new Error(
+          `Folder path segment "${segment}" matches ${matches.length} folders, so the result ` +
+          "would be ambiguous.");
+      }
+      currentId = matches[0];
+    }
+
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: "Resolve a Google Drive folder path",
+      description:
+        "Looked up a folder path in Google Drive.\n\n" +
+        formatApprovalField("Path", segments.join("/")),
+    });
+    return new DriveFolderImpl(this.#ctx, currentId);
+  }
+
+  async ensureFolderPath(path: string): Promise<DriveFolder> {
+    let segments = this.#pathSegments(path).map(segment => checkDriveName(segment, "folder"));
+    let currentId = this.#folderId;
+
+    for (let segment of segments) {
+      // Rebuilt per segment: a folder created for an earlier segment must be visible to the next.
+      let overlay = driveOverlay(this.#ctx);
+      let matches = await this.#findChildFolders(currentId, segment, overlay);
+      if (matches.length > 1) {
+        throw new Error(
+          `Folder path segment "${segment}" matches ${matches.length} folders, so the result ` +
+          "would be ambiguous.");
+      }
+      if (matches.length === 1) {
+        currentId = matches[0];
+        continue;
+      }
+      currentId = await this.#submitCreateFolder(currentId, segment, path);
+    }
+
+    return new DriveFolderImpl(this.#ctx, currentId);
+  }
+
+  async #submitCreateFolder(parentId: string, name: string, pathContext?: string): Promise<string> {
+    let parentName = (await this.#describeTarget(parentId)) ?? "the connected folder";
+    let actionId = await submitDriveAction(
+      this.#ctx,
+      id => ({
+        type: "createFolder",
+        syntheticId: syntheticId(id),
+        parentId,
+        name,
+        submittedAt: Date.now(),
+      }),
+      () => ({
+        title: `Create Drive folder: ${name}`,
+        description:
+          `Create a new folder in Google Drive inside **${parentName}**.` +
+          (pathContext ? ` Part of ensuring the path \`${pathContext}\`.` : "") +
+          "\n\n" + formatApprovalField("Folder name", name),
+        implementsRevert: true,
+      }),
+    );
+    return syntheticId(actionId);
+  }
+
+  // Human-readable name for an ID, for approval descriptions. Undefined if it cannot be read.
+  async #describeTarget(id: string): Promise<string | undefined> {
+    let overlay = driveOverlay(this.#ctx);
+    let item = overlay.created.get(id);
+    if (item) return item.name;
+    let realId = driveRealId(this.#ctx, id);
+    if (realId === undefined) return undefined;
+    try {
+      return overlayItemInfo((await this.#ctx.api.getFile(realId)).info, overlay).name;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async createFolder(name: string): Promise<DriveFolder> {
+    let folderName = checkDriveName(name, "folder");
+    let createdId = await this.#submitCreateFolder(this.#folderId, folderName);
+    return new DriveFolderImpl(this.#ctx, createdId);
+  }
+
+  async uploadFile(
+    name: string,
+    content: string | ArrayBuffer,
+    options?: { mimeType?: string },
+  ): Promise<DriveFile> {
+    let fileName = checkDriveName(name, "file");
+    let { bytes, mimeType } = driveContentBytes(content, options?.mimeType);
+    let parentName = (await this.#describeTarget(this.#folderId)) ?? "the connected folder";
+    let parentId = this.#folderId;
+
+    let actionId = await submitDriveAction(
+      this.#ctx,
+      id => ({
+        type: "uploadFile",
+        syntheticId: syntheticId(id),
+        parentId,
+        name: fileName,
+        mimeType,
+        contentKey: driveContentKey(id),
+        sizeBytes: bytes.byteLength,
+        submittedAt: Date.now(),
+      }),
+      () => ({
+        title: `Upload Drive file: ${fileName}`,
+        description:
+          `Upload a new ${mimeType} file of ${bytes.byteLength.toLocaleString()} bytes into ` +
+          `**${parentName}**.\n\n` + formatApprovalField("File name", fileName),
+        implementsRevert: true,
+      }),
+      bytes,
+    );
+    return new DriveFileImpl(this.#ctx, syntheticId(actionId));
+  }
+
+  async rename(newName: string): Promise<void> {
+    await submitDriveRename(this.#ctx, this.#folderId, newName, "folder");
+  }
+
+  async moveTo(destination: DriveFolder): Promise<void> {
+    let destinationId = await resolveDriveDestination(this.#ctx, destination);
+    if (destinationId === this.#folderId) {
+      throw new Error("A folder cannot be moved into itself.");
+    }
+    let realDestination = driveRealId(this.#ctx, destinationId);
+    let realSelf = driveRealId(this.#ctx, this.#folderId);
+    if (realDestination !== undefined && realSelf !== undefined &&
+        await this.#ctx.api.isWithinFolder(realDestination, realSelf)) {
+      throw new Error("A folder cannot be moved into one of its own descendants.");
+    }
+    await submitDriveMove(this.#ctx, this.#folderId, destinationId, "folder");
+  }
+
+  async trash(): Promise<void> {
+    await submitDriveTrash(this.#ctx, this.#folderId, "folder", true);
+  }
+
+  async restore(): Promise<void> {
+    await submitDriveTrash(this.#ctx, this.#folderId, "folder", false);
+  }
+
+  async listSharing(): Promise<DriveSharingEntry[]> {
+    let overlay = driveOverlay(this.#ctx);
+    let info = await this.#info(overlay);
+    let realId = driveRealId(this.#ctx, this.#folderId);
+    let sharing = realId === undefined ? [] : await this.#ctx.api.listPermissions(realId);
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: "Read Google Drive folder sharing",
+      description: realId === undefined
+        ? "This folder is not in Google Drive yet, so it has no sharing grants.\n\n" +
+          formatApprovalField("Folder", info.name)
+        : `Read the ${sharing.length} sharing grant(s) on a Google Drive folder.\n\n` +
+          formatApprovalField("Folder", info.name),
+    });
+    return sharing;
+  }
+}
+
+// Rename / move / trash are identical for files and folders apart from wording, so they share these
+// helpers rather than being written twice.
+async function submitDriveRename(
+  ctx: DriveSessionContext,
+  fileId: string,
+  newName: string,
+  what: "file" | "folder",
+): Promise<void> {
+  let name = checkDriveName(newName, what);
+  let overlay = driveOverlay(ctx);
+  let realId = driveRealId(ctx, fileId);
+  let previousName = realId === undefined
+      ? overlay.created.get(fileId)?.name
+      : overlayItemInfo((await ctx.api.getFile(realId)).info, overlay).name;
+  if (previousName === undefined && realId === undefined) {
+    throw new Error(DRIVE_PENDING_GONE_MESSAGE);
+  }
+
+  await submitDriveAction(
+    ctx,
+    () => ({
+      type: "rename",
+      fileId,
+      name,
+      // Only a committed item can be restored to its previous name by revertAction().
+      ...(realId !== undefined && previousName !== undefined ? { previousName } : {}),
+      submittedAt: Date.now(),
+    }),
+    () => ({
+      title: `Rename Drive ${what}: ${previousName ?? fileId} → ${name}`,
+      description:
+        `Rename a Google Drive ${what}.\n\n` +
+        formatApprovalField("From", previousName ?? "(pending item)") + "\n\n" +
+        formatApprovalField("To", name),
+      implementsRevert: realId !== undefined,
+    }),
+  );
+}
+
+async function submitDriveMove(
+  ctx: DriveSessionContext,
+  fileId: string,
+  destinationId: string,
+  what: "file" | "folder",
+): Promise<void> {
+  let overlay = driveOverlay(ctx);
+  let realId = driveRealId(ctx, fileId);
+  let previousParentId = realId === undefined
+      ? overlay.created.get(fileId)?.parentId
+      : overlay.patches.get(fileId)?.parentId ?? (await ctx.api.getFile(realId)).parents[0];
+
+  await submitDriveAction(
+    ctx,
+    () => ({
+      type: "move",
+      fileId,
+      parentId: destinationId,
+      ...(previousParentId !== undefined && !isSyntheticId(previousParentId)
+        ? { previousParentId }
+        : {}),
+      submittedAt: Date.now(),
+    }),
+    () => ({
+      title: `Move Drive ${what}`,
+      description:
+        `Move a Google Drive ${what} to a different folder.\n\n` +
+        formatApprovalField("Item", fileId) + "\n\n" +
+        formatApprovalField("Destination", destinationId),
+      implementsRevert: previousParentId !== undefined && !isSyntheticId(previousParentId),
+    }),
+  );
+}
+
+async function submitDriveTrash(
+  ctx: DriveSessionContext,
+  fileId: string,
+  what: "file" | "folder",
+  trash: boolean,
+): Promise<void> {
+  let name = await driveTargetName(ctx, fileId);
+  await submitDriveAction(
+    ctx,
+    () => ({
+      type: trash ? "trash" : "restore",
+      fileId,
+      submittedAt: Date.now(),
+    }),
+    () => ({
+      title: trash
+        ? `Trash Drive ${what}: ${name ?? fileId}`
+        : `Restore Drive ${what}: ${name ?? fileId}`,
+      description: trash
+        ? `Move a Google Drive ${what} to the trash.` +
+          (what === "folder" ? " Its contents go with it." : "") + "\n\n" +
+          formatApprovalField("Item", name ?? fileId)
+        : `Restore a Google Drive ${what} from the trash.\n\n` +
+          formatApprovalField("Item", name ?? fileId),
+      implementsRevert: true,
+    }),
+  );
+}
+
+async function driveTargetName(
+    ctx: DriveSessionContext, fileId: string): Promise<string | undefined> {
+  let overlay = driveOverlay(ctx);
+  let item = overlay.created.get(fileId);
+  if (item) return item.name;
+  let realId = driveRealId(ctx, fileId);
+  if (realId === undefined) return undefined;
+  try {
+    return overlayItemInfo((await ctx.api.getFile(realId)).info, overlay).name;
+  } catch {
+    return undefined;
+  }
+}
+
+@validateRpc()
+class DriveFileImpl extends RpcTarget implements DriveFileSession {
+  #ctx: DriveSessionContext;
+  #fileId: string;
+  #ownsQueue: boolean;
+
+  constructor(ctx: DriveSessionContext, fileId: string, ownsQueue = false) {
+    super();
+    this.#ctx = ctx;
+    this.#fileId = fileId;
+    this.#ownsQueue = ownsQueue;
+  }
+
+  [Symbol.dispose](): void {
+    if (this.#ownsQueue) this.#ctx.approvalQueue[Symbol.dispose]();
+  }
+
+  async #info(overlay: DriveOverlay): Promise<DriveItemInfo> {
+    let realId = driveRealId(this.#ctx, this.#fileId);
+    if (realId === undefined) {
+      let item = overlay.created.get(this.#fileId);
+      if (item === undefined) throw new Error(DRIVE_PENDING_GONE_MESSAGE);
+      return pendingItemInfo(item);
+    }
+    return overlayItemInfo((await this.#ctx.api.getFile(realId)).info, overlay);
+  }
+
+  // Content staged by a pending upload or write, which reads must serve instead of Drive's copy.
+  #pendingContentKey(overlay: DriveOverlay): string | undefined {
+    return overlay.created.get(this.#fileId)?.contentKey
+        ?? overlay.patches.get(this.#fileId)?.contentKey;
+  }
+
+  async getMetadata(): Promise<DriveItemInfo> {
+    let info = await this.#info(driveOverlay(this.#ctx));
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: "Read Google Drive file metadata",
+      description:
+        "Read metadata for a Google Drive file.\n\n" + formatApprovalField("File", info.name),
+    });
+    return info;
+  }
+
+  async readText(): Promise<DriveTextContent> {
+    let overlay = driveOverlay(this.#ctx);
+    let info = await this.#info(overlay);
+    let source = textSourceFor(info);
+    if (source === undefined) {
+      throw new Error(
+        `"${info.name}" (${info.mimeType}) has no text form. Use readBytes() for binary content.`);
+    }
+
+    let pendingKey = this.#pendingContentKey(overlay);
+    let result: { text: string; truncated: boolean };
+    if (pendingKey !== undefined) {
+      let bytes = this.#ctx.content.get(pendingKey);
+      if (bytes === undefined) throw new Error(DRIVE_PENDING_GONE_MESSAGE);
+      let truncated = bytes.byteLength > MAX_TEXT_BYTES;
+      result = {
+        text: new TextDecoder().decode(truncated ? bytes.subarray(0, MAX_TEXT_BYTES) : bytes),
+        truncated,
+      };
+    } else {
+      let realId = driveRealId(this.#ctx, this.#fileId);
+      if (realId === undefined) throw new Error(DRIVE_PENDING_GONE_MESSAGE);
+      result = source.via === "export"
+          ? await this.#ctx.api.exportText(realId, source.exportMimeType)
+          : await this.#ctx.api.downloadText(realId);
+    }
+
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: `Read Google Drive file "${info.name}"`,
+      description:
+        `Read ${result.text.length.toLocaleString()} characters of ${source.format} content` +
+        `${result.truncated ? " (truncated)" : ""} from a Google Drive file.\n\n` +
+        formatApprovalField("File", info.name),
+    });
+
+    return { text: result.text, format: source.format, truncated: result.truncated };
+  }
+
+  async readBytes(): Promise<ArrayBuffer> {
+    let overlay = driveOverlay(this.#ctx);
+    let info = await this.#info(overlay);
+    if (info.kind === "folder") {
+      throw new Error(`"${info.name}" is a folder, which has no bytes to read.`);
+    }
+    if (info.nativeType !== undefined) {
+      throw new Error(
+        `"${info.name}" is a Google ${info.nativeType} and has no stored bytes. Use readText() ` +
+        "instead.");
+    }
+    if (info.sizeBytes !== undefined && info.sizeBytes > MAX_BINARY_BYTES) {
+      throw new Error(
+        `"${info.name}" is ${info.sizeBytes.toLocaleString()} bytes, over the ` +
+        `${MAX_BINARY_BYTES.toLocaleString()}-byte read limit.`);
+    }
+
+    let pendingKey = this.#pendingContentKey(overlay);
+    let bytes: ArrayBuffer;
+    if (pendingKey !== undefined) {
+      let staged = this.#ctx.content.get(pendingKey);
+      if (staged === undefined) throw new Error(DRIVE_PENDING_GONE_MESSAGE);
+      bytes = staged.slice().buffer;
+    } else {
+      let realId = driveRealId(this.#ctx, this.#fileId);
+      if (realId === undefined) throw new Error(DRIVE_PENDING_GONE_MESSAGE);
+      bytes = await this.#ctx.api.downloadBytes(realId);
+    }
+
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: `Read Google Drive file "${info.name}"`,
+      description:
+        `Read ${bytes.byteLength.toLocaleString()} bytes (${info.mimeType}) from a Google Drive ` +
+        "file.\n\n" + formatApprovalField("File", info.name),
+    });
+    return bytes;
+  }
+
+  async write(content: string | ArrayBuffer, options?: { mimeType?: string }): Promise<void> {
+    let overlay = driveOverlay(this.#ctx);
+    let info = await this.#info(overlay);
+    if (info.kind === "folder") {
+      throw new Error(`"${info.name}" is a folder, so it has no content to write.`);
+    }
+    if (info.nativeType !== undefined) {
+      throw new Error(
+        `"${info.name}" is a Google ${info.nativeType}, whose body cannot be replaced through ` +
+        "Drive. Connect its webUrl as a Google Doc to edit it.");
+    }
+    let { bytes, mimeType } = driveContentBytes(content, options?.mimeType ?? info.mimeType);
+    let fileId = this.#fileId;
+
+    await submitDriveAction(
+      this.#ctx,
+      id => ({
+        type: "write",
+        fileId,
+        mimeType,
+        contentKey: driveContentKey(id),
+        sizeBytes: bytes.byteLength,
+        submittedAt: Date.now(),
+      }),
+      () => ({
+        title: `Replace contents of Drive file: ${info.name}`,
+        description:
+          `Replace the contents of a Google Drive file with ${bytes.byteLength.toLocaleString()} ` +
+          `bytes of ${mimeType}. The previous contents are not kept, so this cannot be ` +
+          "reverted automatically.\n\n" + formatApprovalField("File", info.name),
+        // The old bytes are not retained, so there is nothing to restore.
+        implementsRevert: false,
+      }),
+      bytes,
+    );
+  }
+
+  async rename(newName: string): Promise<void> {
+    await submitDriveRename(this.#ctx, this.#fileId, newName, "file");
+  }
+
+  async moveTo(destination: DriveFolder): Promise<void> {
+    let destinationId = await resolveDriveDestination(this.#ctx, destination);
+    await submitDriveMove(this.#ctx, this.#fileId, destinationId, "file");
+  }
+
+  async copyTo(destination: DriveFolder, name?: string): Promise<DriveFile> {
+    let destinationId = await resolveDriveDestination(this.#ctx, destination);
+    let overlay = driveOverlay(this.#ctx);
+    let info = await this.#info(overlay);
+    if (info.kind === "folder") {
+      throw new Error("A folder cannot be copied.");
+    }
+    let realId = driveRealId(this.#ctx, this.#fileId);
+    if (realId === undefined) {
+      throw new Error(
+        "This file has not been created in Drive yet, so it cannot be copied. Approve the upload " +
+        "that creates it first.");
+    }
+    let copyName = name === undefined
+        ? `Copy of ${info.name}`.slice(0, MAX_DRIVE_NAME_LENGTH)
+        : checkDriveName(name, "file");
+    let sourceId = this.#fileId;
+
+    let actionId = await submitDriveAction(
+      this.#ctx,
+      id => ({
+        type: "copy",
+        syntheticId: syntheticId(id),
+        sourceId,
+        parentId: destinationId,
+        name: copyName,
+        mimeType: info.mimeType,
+        ...(info.sizeBytes !== undefined ? { sizeBytes: info.sizeBytes } : {}),
+        submittedAt: Date.now(),
+      }),
+      () => ({
+        title: `Copy Drive file: ${info.name} → ${copyName}`,
+        description:
+          "Copy a Google Drive file into another folder.\n\n" +
+          formatApprovalField("Source", info.name) + "\n\n" +
+          formatApprovalField("Copy name", copyName),
+        implementsRevert: true,
+      }),
+    );
+    return new DriveFileImpl(this.#ctx, syntheticId(actionId));
+  }
+
+  async convertToDoc(
+    destination: DriveFolder,
+    options?: { name?: string; ocrLanguage?: string },
+  ): Promise<DriveFile> {
+    let destinationId = await resolveDriveDestination(this.#ctx, destination);
+    let overlay = driveOverlay(this.#ctx);
+    let info = await this.#info(overlay);
+
+    if (info.nativeType !== undefined) {
+      throw new Error(
+        `"${info.name}" is already a Google ${info.nativeType}; read it with readText() instead ` +
+        "of converting it.");
+    }
+    if (!isOcrConvertible(info.mimeType)) {
+      throw new Error(
+        `"${info.name}" (${info.mimeType}) cannot be converted. Only PDFs and raster images can ` +
+        "be run through OCR.");
+    }
+    let realId = driveRealId(this.#ctx, this.#fileId);
+    if (realId === undefined) {
+      throw new Error(
+        "This file has not been created in Drive yet, so it cannot be converted. Approve the " +
+        "upload that creates it first.");
+    }
+
+    let docName = options?.name === undefined
+        ? info.name.replace(/\.[^./\\]+$/, "").slice(0, MAX_DRIVE_NAME_LENGTH) || info.name
+        : checkDriveName(options.name, "file");
+    let ocrLanguage = options?.ocrLanguage === undefined
+        ? undefined
+        : checkOcrLanguage(options.ocrLanguage);
+    let sourceId = this.#fileId;
+
+    let actionId = await submitDriveAction(
+      this.#ctx,
+      id => ({
+        type: "copy",
+        syntheticId: syntheticId(id),
+        sourceId,
+        parentId: destinationId,
+        name: docName,
+        // The copy is a Doc, not another PDF, so the pending item reads back as one. Google
+        // editor files carry no size, so none is recorded.
+        mimeType: GOOGLE_DOC_MIME_TYPE,
+        targetMimeType: GOOGLE_DOC_MIME_TYPE,
+        ...(ocrLanguage ? { ocrLanguage } : {}),
+        submittedAt: Date.now(),
+      }),
+      () => ({
+        title: `Convert Drive file to a Doc: ${info.name}`,
+        description:
+          `Run Google's OCR over a ${info.mimeType} and save the recognized text as a new Google ` +
+          `Doc.${ocrLanguage ? ` Language hint: ${ocrLanguage}.` : ""}\n\n` +
+          formatApprovalField("Source", info.name) + "\n\n" +
+          formatApprovalField("New document", docName),
+        implementsRevert: true,
+      }),
+    );
+    return new DriveFileImpl(this.#ctx, syntheticId(actionId));
+  }
+
+  async trash(): Promise<void> {
+    await submitDriveTrash(this.#ctx, this.#fileId, "file", true);
+  }
+
+  async restore(): Promise<void> {
+    await submitDriveTrash(this.#ctx, this.#fileId, "file", false);
+  }
+
+  async listSharing(): Promise<DriveSharingEntry[]> {
+    let overlay = driveOverlay(this.#ctx);
+    let info = await this.#info(overlay);
+    let realId = driveRealId(this.#ctx, this.#fileId);
+    let sharing = realId === undefined ? [] : await this.#ctx.api.listPermissions(realId);
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: "Read Google Drive file sharing",
+      description: realId === undefined
+        ? "This file is not in Google Drive yet, so it has no sharing grants.\n\n" +
+          formatApprovalField("File", info.name)
+        : `Read the ${sharing.length} sharing grant(s) on a Google Drive file.\n\n` +
+          formatApprovalField("File", info.name),
+    });
+    return sharing;
+  }
+}
+
+@validateRpc()
+class DriveSessionImpl extends RpcTarget implements DriveSession {
+  #ctx: DriveSessionContext;
+
+  constructor(ctx: DriveSessionContext) {
+    super();
+    this.#ctx = ctx;
+  }
+
+  [Symbol.dispose](): void {
+    this.#ctx.approvalQueue[Symbol.dispose]();
+  }
+
+  async getRoot(): Promise<DriveFolder> {
+    // Returns a capability only; the folder's own data is authorized when it is read.
+    let root = await this.#ctx.api.getRootFolder();
+    return new DriveFolderImpl(this.#ctx, root.info.id);
+  }
+
+  async search(filter?: DriveSearchFilter): Promise<Cursor<DriveEntry>> {
+    return new DriveEntryCursorImpl(this.#ctx, { kind: "search", filter, groups: undefined });
+  }
+
+  async listRecent(limit?: number): Promise<DriveEntry[]> {
+    let requested = limit === undefined ? 25 : Math.trunc(limit);
+    if (!Number.isFinite(requested) || requested < 1) {
+      throw new Error("listRecent limit must be a positive number.");
+    }
+    let max = Math.min(requested, 100);
+    let overlay = driveOverlay(this.#ctx);
+
+    // Pending creations are the newest thing in the Drive by definition, so they lead the list.
+    let listed = new Set<string>();
+    let infos = pendingSearchMatches(overlay, undefined, undefined, listed)
+        .toSorted((a, b) => b.modified.valueOf() - a.modified.valueOf())
+        .slice(0, max);
+
+    let pageToken: string | undefined;
+    while (infos.length < max) {
+      let page = await this.#ctx.api.search(
+          { orderBy: "modified", descending: true }, undefined, pageToken);
+      for (let record of page.files) {
+        if (infos.length >= max) break;
+        let info = overlayItemInfo(record.info, overlay);
+        if (info.trashed) continue;
+        infos.push(info);
+      }
+      pageToken = page.nextPageToken;
+      if (pageToken === undefined) break;
+    }
+
+    let entries: DriveEntry[] = [];
+    for (let info of infos) {
+      entries.push(await toDriveEntry(this.#ctx, info));
+    }
+
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: `Read ${entries.length} recently modified Google Drive item(s)`,
+      description:
+        "Listed the most recently modified items in Google Drive.\n\n" +
+        formatApprovalField("Names", entries.map(entry => entry.info.name).join("\n")),
+    });
+    return entries;
+  }
+
+  async itemFromUrl(url: string): Promise<DriveEntry> {
+    let fileId = driveItemIdFromUrl(url);
+    if (fileId === undefined) {
+      throw new Error(`Not a recognized Google Drive or Google editor URL: ${url}`);
+    }
+
+    let overlay = driveOverlay(this.#ctx);
+    let info = overlayItemInfo((await this.#ctx.api.getFile(fileId)).info, overlay);
+    if (info.trashed) {
+      throw new Error(`"${info.name}" is in the trash.`);
+    }
+    let entry = await toDriveEntry(this.#ctx, info);
+
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: "Resolve a Google Drive URL",
+      description:
+        "Read metadata for the Google Drive item named by a URL.\n\n" +
+        formatApprovalField("Item", info.name),
+    });
+    return entry;
+  }
+}
+
+// --- Applying, rejecting, and reverting Drive actions ------------------------------------
+
+// What an applied action did, so revertAction() can undo it after the pending record is gone.
+type DriveRevertRecord =
+  | { type: "created"; fileId: string; name: string }
+  | { type: "renamed"; fileId: string; previousName: string; name: string }
+  | { type: "moved"; fileId: string; previousParentId: string; parentId: string }
+  | { type: "trashed"; fileId: string }
+  | { type: "restored"; fileId: string };
+
+/**
+ * Performs approved Drive actions against the API. Shared by all three Drive gatekeepers, which
+ * differ only in what they bind to.
+ */
+class DriveActionRunner {
+  #storage: DurableObjectStorage;
+  #api: GoogleDriveApi;
+  #pending: PendingActionStore<DriveAction>;
+  #idMap: DriveIdMap;
+  #content: DrivePendingContentStore;
+
+  constructor(storage: DurableObjectStorage, api: GoogleDriveApi) {
+    this.#storage = storage;
+    this.#api = api;
+    this.#pending = new PendingActionStore<DriveAction>(storage.kv);
+    this.#idMap = new DriveIdMap(storage.kv);
+    this.#content = new DrivePendingContentStore(storage.sql);
+  }
+
+  #revertKey(actionId: number): string {
+    return `drive:revert:${actionId}`;
+  }
+
+  #recordRevert(actionId: number, record: DriveRevertRecord): void {
+    this.#storage.kv.put(this.#revertKey(actionId), record);
+    let keys = [...this.#storage.kv.list<DriveRevertRecord>({ prefix: "drive:revert:" })]
+        .map(([key]) => key);
+    if (keys.length > MAX_DRIVE_REVERT_RECORDS) {
+      // Keys sort lexicographically, so oldest-first requires comparing the numeric suffix.
+      let oldest = keys
+          .map(key => ({ key, id: Number(key.slice("drive:revert:".length)) }))
+          .filter(entry => Number.isFinite(entry.id))
+          .toSorted((a, b) => a.id - b.id)
+          .slice(0, keys.length - MAX_DRIVE_REVERT_RECORDS);
+      for (let entry of oldest) this.#storage.kv.delete(entry.key);
+    }
+  }
+
+  #discard(actionId: number, action: DriveAction): void {
+    this.#pending.remove(actionId);
+    if (action.type === "uploadFile" || action.type === "write") {
+      this.#content.delete(action.contentKey);
+    }
+  }
+
+  /**
+   * The pending action that must be approved first, if this one references a creation that has not
+   * happened yet.
+   */
+  #blockingDependency(action: DriveAction): number | undefined {
+    for (let id of referencedIds(action)) {
+      if (!isSyntheticId(id)) continue;
+      if (this.#idMap.lookup(id) !== undefined) continue;
+      let blockingId = Number(id.slice(SYNTHETIC_ID_PREFIX.length));
+      if (Number.isFinite(blockingId)) return blockingId;
+    }
+    return undefined;
+  }
+
+  // Mark every pending action that depends on `syntheticIds` as unperformable, transitively.
+  #invalidateDependents(syntheticIds: string[], reason: string): void {
+    let doomed = new Set(syntheticIds);
+    for (let { id, action } of this.#pending.list()) {
+      if (action.invalidatedReason) continue;
+      if (!referencedIds(action).some(referenced => doomed.has(referenced))) continue;
+      let created = createdSyntheticId(action);
+      if (created) doomed.add(created);
+      this.#pending.put(id, { ...action, invalidatedReason: reason });
+    }
+  }
+
+  async apply(actionId: number): Promise<void> {
+    let action = this.#pending.get(actionId);
+    if (action === undefined) {
+      throw new Error(`Unknown pending Google Drive action: ${actionId}`);
+    }
+    if (action.invalidatedReason) {
+      // Dropped rather than failed: the user approved something that can no longer happen.
+      this.#discard(actionId, action);
+      return;
+    }
+
+    let blocking = this.#blockingDependency(action);
+    if (blocking !== undefined) {
+      throw new Error(
+        `This change depends on Drive change ${blocking}, which has not been approved yet. ` +
+        `Approve ${blocking} first.`);
+    }
+
+    switch (action.type) {
+      case "createFolder": {
+        let created = await this.#api.createFolder(
+            this.#idMap.resolve(action.parentId), action.name);
+        this.#idMap.record(action.syntheticId, created.info.id);
+        this.#recordRevert(actionId, {
+          type: "created", fileId: created.info.id, name: created.info.name,
+        });
+        break;
+      }
+
+      case "uploadFile": {
+        let content = this.#content.get(action.contentKey);
+        if (content === undefined) {
+          throw new Error("The content staged for this upload is no longer available.");
+        }
+        let created = await this.#api.uploadFile(
+            this.#idMap.resolve(action.parentId), action.name, action.mimeType, content);
+        this.#idMap.record(action.syntheticId, created.info.id);
+        this.#recordRevert(actionId, {
+          type: "created", fileId: created.info.id, name: created.info.name,
+        });
+        break;
+      }
+
+      case "copy": {
+        let created = await this.#api.copyFile(
+            this.#idMap.resolve(action.sourceId),
+            this.#idMap.resolve(action.parentId),
+            action.name,
+            {
+              ...(action.targetMimeType ? { targetMimeType: action.targetMimeType } : {}),
+              ...(action.ocrLanguage ? { ocrLanguage: action.ocrLanguage } : {}),
+            });
+        this.#idMap.record(action.syntheticId, created.info.id);
+        this.#recordRevert(actionId, {
+          type: "created", fileId: created.info.id, name: created.info.name,
+        });
+        break;
+      }
+
+      case "write": {
+        let content = this.#content.get(action.contentKey);
+        if (content === undefined) {
+          throw new Error("The content staged for this write is no longer available.");
+        }
+        await this.#api.updateContent(
+            this.#idMap.resolve(action.fileId), action.mimeType, content);
+        break;
+      }
+
+      case "rename": {
+        let fileId = this.#idMap.resolve(action.fileId);
+        await this.#api.updateMetadata(fileId, { name: action.name });
+        if (action.previousName !== undefined) {
+          this.#recordRevert(actionId, {
+            type: "renamed", fileId, previousName: action.previousName, name: action.name,
+          });
+        }
+        break;
+      }
+
+      case "move": {
+        let fileId = this.#idMap.resolve(action.fileId);
+        let parentId = this.#idMap.resolve(action.parentId);
+        // Re-read the current parent: it may have changed since the action was submitted, and
+        // Drive needs the exact parent to remove.
+        let current = await this.#api.getFile(fileId);
+        let previousParentId = current.parents[0];
+        await this.#api.updateMetadata(fileId, {
+          addParents: parentId,
+          ...(previousParentId ? { removeParents: previousParentId } : {}),
+        });
+        if (previousParentId !== undefined) {
+          this.#recordRevert(actionId, {
+            type: "moved", fileId, previousParentId, parentId,
+          });
+        }
+        break;
+      }
+
+      case "trash": {
+        let fileId = this.#idMap.resolve(action.fileId);
+        await this.#api.updateMetadata(fileId, { trashed: true });
+        this.#recordRevert(actionId, { type: "trashed", fileId });
+        break;
+      }
+
+      case "restore": {
+        let fileId = this.#idMap.resolve(action.fileId);
+        await this.#api.updateMetadata(fileId, { trashed: false });
+        this.#recordRevert(actionId, { type: "restored", fileId });
+        break;
+      }
+
+      default:
+        action satisfies never;
+        throw new Error(`Unknown Drive action type: ${(action as { type: string }).type}`);
+    }
+
+    this.#discard(actionId, action);
+  }
+
+  async reject(actionId: number): Promise<void> {
+    let action = this.#pending.get(actionId);
+    if (action === undefined) return;
+
+    let created = createdSyntheticId(action);
+    if (created !== undefined) {
+      // Anything queued against an item that will now never exist cannot be performed either.
+      this.#invalidateDependents(
+        [created],
+        `A Drive change was dropped because the item it applies to was never created: change ` +
+        `${actionId} was rejected.`);
+    }
+    this.#discard(actionId, action);
+  }
+
+  async revert(actionId: number)
+      : Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
+    let record = this.#storage.kv.get<DriveRevertRecord>(this.#revertKey(actionId));
+    if (record === undefined) {
+      return {
+        message:
+          "This Drive change cannot be undone automatically. Replaced file contents are not kept, " +
+          "and changes older than the most recent few hundred are no longer tracked.",
+      };
+    }
+
+    try {
+      switch (record.type) {
+        case "created":
+          // Trashed rather than deleted: recoverable if the revert itself was a mistake.
+          await this.#api.updateMetadata(record.fileId, { trashed: true });
+          this.#storage.kv.delete(this.#revertKey(actionId));
+          return { message: `Moved **${record.name}** to the trash.` };
+
+        case "renamed":
+          await this.#api.updateMetadata(record.fileId, { name: record.previousName });
+          this.#storage.kv.delete(this.#revertKey(actionId));
+          return;
+
+        case "moved": {
+          let current = await this.#api.getFile(record.fileId);
+          let currentParentId = current.parents[0];
+          await this.#api.updateMetadata(record.fileId, {
+            addParents: record.previousParentId,
+            ...(currentParentId ? { removeParents: currentParentId } : {}),
+          });
+          this.#storage.kv.delete(this.#revertKey(actionId));
+          return;
+        }
+
+        case "trashed":
+          await this.#api.updateMetadata(record.fileId, { trashed: false });
+          this.#storage.kv.delete(this.#revertKey(actionId));
+          return;
+
+        case "restored":
+          await this.#api.updateMetadata(record.fileId, { trashed: true });
+          this.#storage.kv.delete(this.#revertKey(actionId));
+          return;
+
+        default:
+          record satisfies never;
+          return;
+      }
+    } catch (error) {
+      logger.warn("failed to revert Google Drive action", {
+        event: "google.drive.action.revert.failed", actionId, error,
+      });
+      return {
+        message: `Could not undo this Drive change: ${errorMessage(error)}`,
+        canRetry: true,
+      };
+    }
+  }
+}
+
+// --- Drive gatekeeper Durable Objects ---------------------------------------------------
+
+type DriveGatekeeperImplProps = {
+  userObjectId: string;
+}
+
+type DriveFolderGatekeeperImplProps = {
+  userObjectId: string;
+  folderId: string;
+}
+
+type DriveFileGatekeeperImplProps = {
+  userObjectId: string;
+  fileId: string;
+}
+
+// Shared by the three Drive gatekeeper Durable Objects, which differ only in what they bind to.
+function driveSessionContext(
+  storage: DurableObjectStorage,
+  api: GoogleDriveApi,
+  approvalQueue: RpcStub<ApprovalQueue>,
+  scopeFolderId: string | undefined,
+): DriveSessionContext {
+  return {
+    api,
+    approvalQueue,
+    scopeFolderId,
+    pending: new PendingActionStore<DriveAction>(storage.kv),
+    idMap: new DriveIdMap(storage.kv),
+    content: new DrivePendingContentStore(storage.sql),
+  };
+}
+
+@validateRpc()
+export class DriveGatekeeperImpl extends DurableObject<Env, DriveGatekeeperImplProps>
+    implements Gatekeeper<DriveSession> {
+  #tokens = new AccessTokenCache(opts => {
+    let account = this.ctx.exports.UserAccount.get(
+      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId),
+    );
+    return account.getAccessToken(opts);
+  });
+
+  #api(): GoogleDriveApi {
+    return new GoogleDriveApi(opts => this.#tokens.get(opts));
+  }
+
+  #runner(): DriveActionRunner {
+    return new DriveActionRunner(this.ctx.storage, this.#api());
+  }
+
+  async describe(): Promise<ResourceDescription> {
+    return {
+      url: `https://${DRIVE_HOST}/drive/my-drive`,
+      title: "Google Drive",
+      snippet: "Google Drive: all files in My Drive",
+      suggestedBindingName: "GOOGLE_DRIVE",
+      tsType: "DriveSession",
+    };
+  }
+
+  async getTypeScriptTypes(): Promise<string> {
+    return DRIVE_TYPES_CODE;
+  }
+
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return [DRIVE_CHANGE_ACTION];
+  }
+
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<DriveSession> {
+    return new DriveSessionImpl(
+        driveSessionContext(this.ctx.storage, this.#api(), approvalQueue.dup(), undefined));
+  }
+
+  async applyAction(action: number): Promise<void> {
+    await this.#runner().apply(action);
+  }
+
+  async rejectAction(action: number): Promise<void> {
+    await this.#runner().reject(action);
+  }
+
+  revertAction(action: number)
+      : Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
+    return this.#runner().revert(action);
+  }
+
+  // Observer tracking — strategy A (private-only). A whole personal Drive spans everything the
+  // account owns, with no single ACL that could stand in for all of it, so the binding is never
+  // shareable. Collaborators who need a subset should be given a folder or file binding.
+  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    throw new Error(
+      "A whole-Drive connection cannot be shared, because a collaborator would observe files " +
+      "across all of My Drive. Connect a specific folder or file instead.");
+  }
+
+  async removeObserver(_id: string): Promise<void> {}
+}
+
+@validateRpc()
+export class DriveFolderGatekeeperImpl extends DurableObject<Env, DriveFolderGatekeeperImplProps>
+    implements Gatekeeper<DriveFolderSession> {
+  #tokens = new AccessTokenCache(opts => {
+    let account = this.ctx.exports.UserAccount.get(
+      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId),
+    );
+    return account.getAccessToken(opts);
+  });
+
+  #api(): GoogleDriveApi {
+    return new GoogleDriveApi(opts => this.#tokens.get(opts));
+  }
+
+  #runner(): DriveActionRunner {
+    return new DriveActionRunner(this.ctx.storage, this.#api());
+  }
+
+  async describe(): Promise<ResourceDescription> {
+    let record = await this.#api().getFile(this.ctx.props.folderId);
+    if (record.info.kind !== "folder") {
+      throw new Error(
+        `Drive item ${this.ctx.props.folderId} is not a folder, so it cannot be connected as one.`);
+    }
+    return {
+      url: `https://${DRIVE_HOST}/drive/folders/${encodeURIComponent(this.ctx.props.folderId)}`,
+      title: record.info.name,
+      snippet: `Google Drive folder: ${record.info.name}`,
+      suggestedBindingName: "DRIVE_FOLDER",
+      tsType: "DriveFolderSession",
+    };
+  }
+
+  async getTypeScriptTypes(): Promise<string> {
+    return DRIVE_TYPES_CODE;
+  }
+
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return [DRIVE_CHANGE_ACTION];
+  }
+
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<DriveFolderSession> {
+    let ctx = driveSessionContext(
+        this.ctx.storage, this.#api(), approvalQueue.dup(), this.ctx.props.folderId);
+    return new DriveFolderImpl(ctx, this.ctx.props.folderId, true);
+  }
+
+  async applyAction(action: number): Promise<void> {
+    await this.#runner().apply(action);
+  }
+
+  async rejectAction(action: number): Promise<void> {
+    await this.#runner().reject(action);
+  }
+
+  revertAction(action: number)
+      : Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
+    return this.#runner().revert(action);
+  }
+
+  // Observer tracking — strategy B (ACL check, single unit). Drive permissions propagate downward
+  // and a descendant cannot be shared more narrowly than its parent, so being able to open this
+  // folder implies access to everything the binding can read.
+  async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    let verifier = user as unknown as Fetcher<GoogleVerifierApi>;
+    if (!(await verifier.hasDriveItemAccess(this.ctx.props.folderId))) {
+      throw new Error(
+        "This collaborator does not have access to the bound Google Drive folder, so they cannot " +
+        "observe data this workspace read from it.");
+    }
+  }
+
+  async removeObserver(_id: string): Promise<void> {}
+}
+
+@validateRpc()
+export class DriveFileGatekeeperImpl extends DurableObject<Env, DriveFileGatekeeperImplProps>
+    implements Gatekeeper<DriveFileSession> {
+  #tokens = new AccessTokenCache(opts => {
+    let account = this.ctx.exports.UserAccount.get(
+      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId),
+    );
+    return account.getAccessToken(opts);
+  });
+
+  #api(): GoogleDriveApi {
+    return new GoogleDriveApi(opts => this.#tokens.get(opts));
+  }
+
+  #runner(): DriveActionRunner {
+    return new DriveActionRunner(this.ctx.storage, this.#api());
+  }
+
+  async describe(): Promise<ResourceDescription> {
+    let record = await this.#api().getFile(this.ctx.props.fileId);
+    if (record.info.kind === "folder") {
+      throw new Error(
+        `Drive item ${this.ctx.props.fileId} is a folder; connect it as a folder instead.`);
+    }
+    return {
+      url: `https://${DRIVE_HOST}/file/d/${encodeURIComponent(this.ctx.props.fileId)}/view`,
+      title: record.info.name,
+      snippet: `Google Drive file: ${record.info.name}`,
+      suggestedBindingName: "DRIVE_FILE",
+      tsType: "DriveFileSession",
+    };
+  }
+
+  async getTypeScriptTypes(): Promise<string> {
+    return DRIVE_TYPES_CODE;
+  }
+
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return [DRIVE_CHANGE_ACTION];
+  }
+
+  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<DriveFileSession> {
+    // A file session hands out no folder capabilities, so there is no subtree to bound. moveTo()
+    // and copyTo() still require a destination capability, which the gadget can only hold if some
+    // other binding granted it.
+    let ctx = driveSessionContext(
+        this.ctx.storage, this.#api(), approvalQueue.dup(), undefined);
+    return new DriveFileImpl(ctx, this.ctx.props.fileId, true);
+  }
+
+  async applyAction(action: number): Promise<void> {
+    await this.#runner().apply(action);
+  }
+
+  async rejectAction(action: number): Promise<void> {
+    await this.#runner().reject(action);
+  }
+
+  revertAction(action: number)
+      : Promise<void | { message?: string; canRetry?: boolean; restart?: boolean }> {
+    return this.#runner().revert(action);
+  }
+
+  // Observer tracking — strategy B (ACL check, single unit): Google applies sharing permissions at
+  // file granularity, so an observer must be able to open this file with their own account.
+  async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    let verifier = user as unknown as Fetcher<GoogleVerifierApi>;
+    if (!(await verifier.hasDriveItemAccess(this.ctx.props.fileId))) {
+      throw new Error(
+        "This collaborator does not have access to the bound Google Drive file, so they cannot " +
+        "observe data this workspace read from it.");
+    }
+  }
+
+  async removeObserver(_id: string): Promise<void> {}
 }

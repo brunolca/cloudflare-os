@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
+import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, GadgetUser, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
@@ -241,6 +241,47 @@ type QueuedAgentCallback = {
 };
 
 type GatekeeperClass = DurableObjectClass<Gatekeeper<any>>;
+
+// Optional entry point a Gadget's Durable Object class may define to learn who is connecting to it.
+// See getGadgetFacet() and the `GadgetUser` docs in workshop-shared/api.
+//
+// Deliberately NOT named "connect": the facet is reached through a Fetcher stub, and Fetcher
+// already has a built-in connect() (the Sockets API). Calling that instead of the Gadget's method
+// fails obscurely -- it parses the identity object as a socket address and reports that the value
+// is not an integer, meaning the port. The same shadowing applies to a Gadget's own methods, so
+// fetch/connect/queue/scheduled are all names a Gadget cannot expose to its client.
+const GADGET_CONNECT_METHOD = "onConnect";
+
+// Did this rejection mean "the Gadget has no onConnect() method", or did the Gadget's own
+// onConnect()
+// throw? Both arrive as a rejected RPC, and the difference is security-relevant: the first is the
+// common case and falls back to the bare facet, while the second must fail the connection rather
+// than hand back an unrestricted stub to a Gadget that intended to gate access.
+//
+// So we match workerd's not-implemented message exactly rather than by substring -- a substring
+// match on "is not a function" would also swallow a TypeError raised *inside* onConnect(), silently
+// downgrading a Gadget's authorization to no authorization at all.
+function isGadgetConnectNotImplemented(err: unknown): boolean {
+  return err instanceof TypeError && err.message ===
+      `The RPC receiver does not implement the method ${JSON.stringify(GADGET_CONNECT_METHOD)}.`;
+}
+
+// Offer `user`'s identity to the Gadget's optional onConnect() method, returning the per-connection
+// capability it hands back, or null to fall through to the bare facet.
+//
+// Null means the Gadget opted out, in one of two ways: it defines no onConnect() at all (every
+// Gadget written before this existed), or its onConnect() recorded the identity and returned
+// nothing, keeping the main Durable Object as the client's stub. Anything else it throws propagates,
+// failing the connection -- see isGadgetConnectNotImplemented for why that matters.
+export async function connectGadgetAs(facet: any, user: GadgetUser)
+    : Promise<RpcStub<any> | null> {
+  try {
+    return await facet[GADGET_CONNECT_METHOD](user) ?? null;
+  } catch (err) {
+    if (!isGadgetConnectNotImplemented(err)) throw err;
+    return null;
+  }
+}
 
 // getAgentCatalog is optional on Gatekeeper; ambient capsules always implement it. After confirming
 // the gatekeeper is an ambient capsule, we view its facet through this derived (Pick + Required)
@@ -2480,7 +2521,13 @@ class OverseerImpl implements AgentHooks {
   //
   // Since facet stubs currently can't be sent over RPC, the stub is wrapped in a Proxy to make it
   // look like an RpcTarget instead.
-  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number): Promise<RpcStub<any>> {
+  //
+  // `user` identifies whoever is driving this connection. When supplied AND the Gadget defines a
+  // `onConnect()` method, we hand the identity to that method and return whatever capability it
+  // gives back, so the Gadget can serve a per-user view (see connectGadgetAs). Callers that aren't
+  // a session -- the agent's bindings, PDF export, hook delivery -- omit it and get the bare facet.
+  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number, user?: GadgetUser)
+      : Promise<RpcStub<any>> {
     let facet = this.getGadgetFacetFetcher(gadgetId, chatId);
 
     let self = this;
@@ -2528,6 +2575,24 @@ class OverseerImpl implements AgentHooks {
         return RpcTarget.prototype;
       },
     });
+
+    if (user) {
+      // Deliberately against `facet`, not `proxy`. The proxy mirrors every rejection into the
+      // gadget's console log, and the overwhelmingly common outcome here is the not-implemented
+      // rejection from a gadget that simply has no onConnect() -- which would put a baffling error
+      // in the console of every gadget written before onConnect() existed, on every connection.
+      // Errors that do matter are forwarded below, so nothing is lost.
+      let session = await connectGadgetAs(facet, user).catch(err => {
+        let event: ConsoleLogEvent = {
+          timestamp: new Date(),
+          level: "error",
+          message: [err instanceof Error ? `${err}\n    at ${GADGET_CONNECT_METHOD}()` : err],
+        };
+        this.deliverGadgetLogs(chatId ?? null, [event]);
+        throw err;
+      });
+      if (session) return session;
+    }
 
     // Explicitly construct an RpcStub around the proxy to work around a workerd bug where
     // returning an RpcTarget proxy as the top-level return value from an RPC isn't detected
@@ -7438,6 +7503,20 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return profilePromise;
   }
 
+  // Identity this session presents to a Gadget's onConnect(). Everyone holding this capability
+  // is the owner or a "build" collaborator, since open() hands anyone lower a UseOverseerInterface.
+  //
+  // An arrow-function field so it stays bound when passed to GadgetClientImpl as a callback.
+  #gadgetUser = async (): Promise<GadgetUser> => {
+    let profile = await this.#getClientProfile();
+    return {
+      id: this.clientProfileId,
+      name: profile.name,
+      role: "build",
+      isOwner: this.isOwner,
+    };
+  };
+
   async getMetadata(): Promise<GadgetMetadata> {
     let result: GadgetMetadata = {
       id: this.impl.ctx.id.toString(),
@@ -7585,14 +7664,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, record.id, this.clientUserId);
+    return new GadgetClientImpl(this.impl, record.id, this.clientUserId, this.#gadgetUser);
   }
 
   async getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>> {
     this.impl.getGadgetRecord(id);  // validate it exists
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, id, this.clientUserId);
+    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.#gadgetUser);
   }
 
   async deleteSelf(): Promise<void> {
@@ -9097,6 +9176,20 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
         this.impl.logger);
   }
 
+  // Identity this session presents to a Gadget's onConnect(). Always role "use" and never the
+  // owner: open() routes the owner and "build" collaborators to OverseerClientInterface instead.
+  //
+  // An arrow-function field so it stays bound when passed to UseGadgetClientInterface.
+  #gadgetUser = async (): Promise<GadgetUser> => {
+    let profile = await this.#clientUser.whoami();
+    return {
+      id: this.clientProfileId,
+      name: profile.name,
+      role: "use",
+      isOwner: false,
+    };
+  };
+
   #leavePresence: () => void;
   #leaveOutputsFanout: () => void;
 
@@ -9180,7 +9273,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new UseGadgetClientInterface(this.impl, id, this.clientUserId);
+    return new UseGadgetClientInterface(this.impl, id, this.clientUserId, this.#gadgetUser);
   }
 
   // --- Denied methods (build-only) ---
@@ -9311,8 +9404,12 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
 // Overseer.createGadget()/getGadget().
 @validateRpc()
 class GadgetClientImpl extends RpcTarget implements GadgetClient {
+  // `gadgetUser` resolves the identity handed to the Gadget's onConnect(). It comes from the
+  // owning session rather than being rebuilt here, so the role it reports is the one open()
+  // authorized -- gadget code must never see a role this session didn't actually earn.
   constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string) {
+      private clientUserId: string,
+      private gadgetUser: () => Promise<GadgetUser>) {
     super();
   }
 
@@ -9352,7 +9449,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
       chat_id: chatId,
       interaction_type: "gadget_ui_connected",
     });
-    return this.impl.getGadgetFacet(this.id, chatId);
+    return this.impl.getGadgetFacet(this.id, chatId, await this.gadgetUser());
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -9558,8 +9655,11 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
 // fails to compile here until a developer decides whether "use" callers may invoke it.
 @validateRpc()
 class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
+  // See GadgetClientImpl's constructor. `gadgetUser` reports role "use" here, which is exactly the
+  // signal a Gadget needs to refuse privileged operations to a use-only collaborator.
   constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string) {
+      private clientUserId: string,
+      private gadgetUser: () => Promise<GadgetUser>) {
     super();
   }
 
@@ -9601,7 +9701,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
       user_id: this.#clientUser.id.toString(),
       interaction_type: "gadget_ui_connected",
     });
-    return this.impl.getGadgetFacet(this.id, undefined);
+    return this.impl.getGadgetFacet(this.id, undefined, await this.gadgetUser());
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {

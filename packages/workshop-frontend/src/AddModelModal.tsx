@@ -17,6 +17,7 @@ type SelectionType =
   | { type: 'custom', provider: AiModelProvider }
 
 const PROVIDER_LABELS: Record<AiModelProvider, string> = {
+  neuralwatt: 'Neuralwatt',
   anthropic: 'Anthropic',
   openai: 'OpenAI',
   google: 'Google',
@@ -26,6 +27,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
 
 // Placeholder hinting at the shape of each provider's API token.
 const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
+  neuralwatt: 'Neuralwatt API key',
   anthropic: 'sk-ant-...',
   openai: 'sk-...',
   google: 'AIza...',

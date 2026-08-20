@@ -1132,8 +1132,15 @@ export type CloudflareAccountOption = {
   accountName: string;
 };
 
-/** Supported AI providers. */
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+/**
+ * Supported AI providers.
+ *
+ * "neuralwatt" is an OpenAI-compatible provider (https://api.neuralwatt.com/v1) that bills by
+ * energy rather than tokens. Cloudflare AI Gateway has no neuralwatt provider, so unlike the
+ * others it is never gateway-routed -- see the short-circuit in ai-models.ts getModel().
+ */
+export type AiModelProvider =
+    "neuralwatt" | "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -1183,6 +1190,20 @@ export const SUGGESTED_MODELS: Record<
   AiModelProvider,
   Record<string, {name: string, contextWindow: number, outputLimit?: number}>
 > = {
+  // Listed first deliberately: getModelList() preserves this order, and both the model picker and
+  // the "first available model" fallback in UserDurableObject.getExternalMessageChatContext() take
+  // the head of that list -- so whichever provider leads this object is the deployment default.
+  //
+  // Context windows are the exact `max_model_len` values advertised by https://api.neuralwatt.com/v1
+  // /models; `outputLimit` is set only where that catalog declares a max_output_tokens.
+  "neuralwatt": {
+    "kimi-k2.7-code": {name: "Kimi K2.7 Code (Neuralwatt)", contextWindow: 262128},
+    "glm-5.2": {name: "GLM 5.2 (Neuralwatt)", contextWindow: 1048560},
+    "kimi-k3": {name: "Kimi K3 (Neuralwatt)", contextWindow: 1048560},
+    "deepseek-v4-flash": {
+      name: "DeepSeek V4 Flash (Neuralwatt)", contextWindow: 1048560, outputLimit: 65536,
+    },
+  },
   "cloudflare": {
     "@cf/moonshotai/kimi-k2.7-code": {
       name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
@@ -3472,6 +3493,41 @@ export interface GatekeeperClient<Session extends RpcCompatible<Session>> extend
  * min(edge role, sharer's effective role). The owner is the implicit root at "build".
  */
 export type CollaboratorRole = "build" | "use";
+
+/**
+ * Identity of whoever is driving one connection to a Gadget's server, handed to the Gadget's
+ * optional server-side `onConnect()` method (see OverseerImpl.getGadgetFacet).
+ *
+ * This is filled in by the platform from the session that opened the Gadget -- it never crosses
+ * the sandbox boundary on its way in, so Gadget code may trust it for authorization. Contrast
+ * with anything the client passes up through the `gadget` RPC stub, which is attacker-controlled:
+ * a `use` collaborator can call any method on the Gadget's Durable Object with any arguments.
+ *
+ * Only sessions get an identity. The coding agent reaching a Gadget through a binding, a Gadget
+ * calling another Gadget, PDF export, and hook delivery all keep the bare Durable Object stub and
+ * never trigger onConnect() -- so a Gadget must not treat "onConnect() was called" as the only way
+ * it is reachable. (The agent already holds build-level access to the Gadget's code, so this
+ * grants it nothing it could not otherwise do.)
+ */
+export type GadgetUser = {
+  /**
+   * Stable identifier -- the caller's profile ID, e.g. "kenton@cloudflare.com". This is the same
+   * key the sharing graph uses, so it's suitable as a storage key for per-user Gadget state.
+   */
+  id: string;
+
+  /** Display name, e.g. "Kenton Varda". For presentation only: not unique, and it can change. */
+  name: string;
+
+  /** The caller's effective role on this Gadget, as computed by the sharing graph at open() time. */
+  role: CollaboratorRole;
+
+  /**
+   * Whether this caller owns the Gadget. The owner is the root of the permission graph and is
+   * always "build".
+   */
+  isOwner: boolean;
+};
 
 /** One person currently connected to a gadget. */
 export type PresenceParticipant = {

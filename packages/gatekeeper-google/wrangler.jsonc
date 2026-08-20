@@ -26,6 +26,12 @@
     {
       "tag": "v3",
       "new_sqlite_classes": [ "GoogleSheetsGatekeeperImpl" ]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": [
+        "DriveGatekeeperImpl", "DriveFolderGatekeeperImpl", "DriveFileGatekeeperImpl"
+      ]
     }
   ],
   "observability": {
