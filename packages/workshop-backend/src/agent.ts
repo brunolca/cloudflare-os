@@ -23,6 +23,9 @@ import {
   seenAlwaysAvailableResources,
 } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
+import {
+  attributeChatMessage, formatChatIdentityPrompt, listChatParticipants,
+} from "./chat-identity";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
 import { traceRejectedToolCall, traceTool } from "./agent-tracing";
@@ -2137,6 +2140,13 @@ async function runAgentPass(
     modelMessages.push(...makeReplayObservation(sequence, text, handle.model, timestamp));
   };
 
+  // Who has written in this chat (see chat-identity.ts). With more than one participant, replay
+  // names the author of each of their messages below, and the system prompt says that it does.
+  // A second participant arriving invalidates the prompt cache once, since it retroactively
+  // attributes the messages already in the log -- worth it to keep the identities straight.
+  let participants = listChatParticipants(chatMessages);
+  let attributeAuthors = participants.length > 1;
+
   // Rebuild the code the compacted prefix left behind: first the checkpoint's pins establish
   // their base trees, then the composed proposed change applies on top. (A pre-conversion
   // checkpoint carries neither -- its retired Yjs fields are ignored; the conversion boundary
@@ -2213,6 +2223,10 @@ async function runAgentPass(
         switch (msg.author.type) {
           case "user":
           case "gadget":
+            // Name the author when the chat has several participants, so a request stays attached
+            // to whoever made it -- otherwise the model reads the one identity in the system prompt
+            // (the current sender) as the author of everything before it too.
+            if (attributeAuthors) content = attributeChatMessage(content, msg.author);
             if (msg.attachments?.length) {
               let parts: (TextContent | ImageContent)[] = [];
               if (content) parts.push({type: "text", text: content});
@@ -3145,6 +3159,15 @@ async function runAgentPass(
           `${savedWorkspace ?? systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
     ];
+  }
+
+  // Name the person (or Gadget) driving this turn. Appended to the dynamic slot, and last within
+  // it: it is the most volatile part of the prompt, since in a shared chat it follows whoever wrote
+  // the message being answered.
+  let identityPrompt = formatChatIdentityPrompt(
+      initiator, attributeAuthors ? participants : undefined);
+  if (identityPrompt) {
+    systemPromptSlots[1] = `${systemPromptSlots[1]}\n\n${identityPrompt}`;
   }
 
   // Shared guidance precedes deployment instructions for both agent types.
