@@ -1011,6 +1011,10 @@ describe("gateway model reasoning levels", () => {
     ["cloudflare", "@cf/deepseek-ai/deepseek-v4-pro-0813", null],
     ["cloudflare", "@cf/cloudflare/clef", null],
     ["cloudflare", "@cf/cloudflare/clef-flash", null],
+    ["neuralwatt", "kimi-k2.7-code", null],
+    ["neuralwatt", "glm-5.2", null],
+    ["neuralwatt", "kimi-k3", null],
+    ["neuralwatt", "deepseek-v4-flash", null],
   ];
   it.each(BUILT_IN)("says what %s model %s is asked for while no level is set",
       (provider, model, builtIn) => {

@@ -24,9 +24,9 @@ declare global {
       // Note: outside gateway mode, Workers AI (provider "cloudflare") is BYOK like every other
       // provider -- the account ID and API token live in the user's model config, not in env.
 
-      // Neuralwatt API key (https://portal.neuralwatt.com). Required whenever "neuralwatt" is
-      // listed in CF_AI_GATEWAY_PROVIDERS, because Neuralwatt has no AI Gateway provider and so
-      // cannot use the Gateway's server-managed keys -- it is called directly with this token.
+      // Neuralwatt API key (https://portal.neuralwatt.com). Only needed when NO AI Gateway is
+      // configured: under gateway mode Neuralwatt is reached as an AI Gateway custom provider
+      // whose key is stored server-side in the Gateway, so this token is unused there.
       NEURALWATT_API_TOKEN?: string;
 
       // Blueprint storage bindings.

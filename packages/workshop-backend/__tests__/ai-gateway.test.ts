@@ -694,8 +694,9 @@ describe("GatewayModels", () => {
   });
 
   // The table keeps its own list of the providers getModel can route through the gateway, so an
-  // added model it offers is one that can run. This holds the two in step.
-  it.each(Object.keys(SUGGESTED_MODELS) as AiModelProvider[])(
+  // added model it offers is one that can run. This holds the two in step. Neuralwatt is routable
+  // but deliberately not addable (see GATEWAY_PROVIDERS), so it is held to that below instead.
+  it.each((Object.keys(SUGGESTED_MODELS) as AiModelProvider[]).filter(p => p !== "neuralwatt"))(
       "offers an added model on %s only if the gateway can route it", (provider) => {
     const unroutable = (() => {
       try {
@@ -720,6 +721,18 @@ describe("GatewayModels", () => {
     } else {
       expect(add).not.toThrow();
     }
+  });
+
+  it("offers no added model on neuralwatt, which only the environment enables", () => {
+    const models = gatewayModels({
+      addedModels: [{ provider: "neuralwatt", id: "test-model", name: "Test", contextWindow: 1000 }],
+    }, "neuralwatt");
+    expect(models.get("test-model")).toBeUndefined();
+    expect(models.get("kimi-k2.7-code")?.provider).toBe("neuralwatt");
+    expect(models.addableProviders).toEqual([]);
+    expect(() => models.assertAddable(
+        { provider: "neuralwatt", id: "test-model", name: "Test", contextWindow: 1000 }))
+        .toThrow('Provider "neuralwatt" is not served through AI Gateway.');
   });
 });
 

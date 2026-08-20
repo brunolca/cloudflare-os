@@ -264,15 +264,24 @@ function neuralwattCompat(): OpenAICompletionsCompat {
   };
 }
 
+/**
+ * Model-field prefix that names Neuralwatt's AI Gateway custom provider on the /compat endpoint.
+ * AI Gateway requires every custom provider slug to be prefixed with `custom-`; the slug itself
+ * ("neuralwatt") is configured in the Gateway dashboard alongside the base URL and the stored key.
+ */
+const NEURALWATT_GATEWAY_MODEL_PREFIX = "custom-neuralwatt/";
+
 // Build the pi model descriptor for reaching a provider's own native API through an AI Gateway
 // (the platform's or a user's). `gatewayUrl` is a gateway root -- over HTTPS
 // (https://gateway.ai.cloudflare.com/v1/{accountId}/{gateway}) or, for binding-routed requests,
 // over the AI binding (https://workers-binding.ai/ai-gateway/gateways/{gateway}); each
 // provider's native API is exposed under the same per-provider path on either. AI Gateway also
-// offers a unified OpenAI-compat
-// translation layer (/compat), which we deliberately never use: we already speak every
-// provider's native API, and the translation drops provider features pi relies on (extended
-// thinking, Anthropic cache_control prompt caching, the OpenAI Responses API). Billing --
+// offers a unified OpenAI-compat translation layer (/compat), which the natively-supported
+// providers deliberately never use: we already speak their native APIs, and the translation drops
+// provider features pi relies on (extended thinking, Anthropic cache_control prompt caching, the
+// OpenAI Responses API). Neuralwatt is the exception -- it is a *custom provider*, which the
+// per-provider native paths cannot address (see the neuralwatt case) -- and it loses nothing by
+// it, being a plain OpenAI-completions endpoint with none of those features. Billing --
 // including unified billing on a user's own gateway -- is orthogonal to which API a request
 // speaks. Returns undefined for providers AI Gateway cannot serve (ollama).
 function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Api> | undefined {
@@ -347,6 +356,34 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         // requests are otherwise sent no effort at all.
         ...(config.reasoning !== undefined ? { thinkingLevelMap: catalog?.thinkingLevelMap } : {}),
         compat: workersAiCompat(catalog),
+      };
+    case "neuralwatt":
+      // Neuralwatt is not in AI Gateway's provider catalog, so it is registered as an AI Gateway
+      // *custom provider* (base_url https://api.neuralwatt.com/v1, slug as named by
+      // NEURALWATT_GATEWAY_MODEL_PREFIX) whose key is stored server-side in the Gateway. Custom
+      // providers are addressed by naming
+      // them in the model field of the unified /compat endpoint -- `custom-<slug>/<model>` -- so
+      // the prefix belongs in the descriptor's `id`, which is what pi sends as `model`. `name`
+      // stays unprefixed, so the UI keeps showing the bare model id.
+      //
+      // The transport is whatever the caller picked (the Workers AI binding in this deployment):
+      // the binding channel carries any gateway path its host names, so /compat needs nothing
+      // special from it. `gatewayUrl` is already the right root either way.
+      //
+      // Cost stays zero on purpose even here: Neuralwatt bills by energy consumed, so a per-token
+      // cost would be fiction. The Gateway logs the request either way, and a log whose cost the
+      // Gateway cannot price falls back to this estimate (see Overseer#getCostFromAiGateway).
+      return {
+        id: `${NEURALWATT_GATEWAY_MODEL_PREFIX}${config.model}`,
+        name: config.model,
+        api: "openai-completions",
+        provider: "neuralwatt",
+        baseUrl: `${gatewayUrl}/compat`,
+        reasoning: true,
+        input: ["text", "image"],
+        cost: ZERO_COST,
+        ...window,
+        compat: neuralwattCompat(),
       };
     default:
       return undefined;
@@ -617,20 +654,17 @@ function signGeminiFunctionCalls(model: Model<Api>, payload: unknown): object | 
 export function getModel(env: Cloudflare.Env, config: AiModelConfig,
                          initiator: AiChatAuthorInfo,
                          options: ModelRoutingOptions = {}): ModelHandle {
-  // Neuralwatt is not a Cloudflare AI Gateway provider (it is absent from the Gateway's provider
-  // catalog), so neither gateway path below can carry it: it always talks straight to
-  // https://api.neuralwatt.com/v1. Checked before the BYOK branch too, because a user's own
-  // Gateway can't proxy it either -- meaning neuralwatt usage is always funded by the
-  // deployment's NEURALWATT_API_TOKEN and never billed to a connected user's account. Consequently
-  // it produces no AI Gateway logs, so no cost is recorded for it (aiGatewayLogRoute is absent).
+  // Neuralwatt is absent from AI Gateway's own provider catalog, so it rides the platform gateway
+  // as a *custom provider* -- a slug plus base URL plus stored key configured in that gateway,
+  // reached over /compat (see gatewayNativeModel). Only the platform gateway has that
+  // registration: a connected user's auto-created "default" gateway does not, so neuralwatt never
+  // takes the BYOK path, and its usage stays funded by the stored key on the platform gateway
+  // rather than by the user's Cloudflare credits. Dropping userGateway here (rather than
+  // reordering the branches) keeps that the *only* difference: neuralwatt otherwise flows through
+  // the same platform-gateway path as every other provider, so it now gets Gateway logs,
+  // attribution metadata, and caching like the rest.
   if (config.provider === "neuralwatt") {
-    let apiToken = config.apiToken || env.NEURALWATT_API_TOKEN;
-    if (!apiToken) {
-      throw new Error(
-          "Neuralwatt models require a Neuralwatt API key. Set the NEURALWATT_API_TOKEN secret on " +
-          "this Worker, or re-add the model with your own key.");
-    }
-    return getModelDirect({ ...config, apiToken }, options.sessionAffinity);
+    options = { ...options, userGateway: undefined };
   }
 
   // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
@@ -647,6 +681,19 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
   let gwConfig = getAiGatewayConfig(env);
   if (gwConfig) {
     return getModelViaGateway(gwConfig, config, initiator, options);
+  }
+
+  // No gateway at all (local dev, or a deployment that never enabled one): Neuralwatt falls back
+  // to its own endpoint, keyed by the model config or the deployment secret. This is the only
+  // route left that needs NEURALWATT_API_TOKEN.
+  if (config.provider === "neuralwatt") {
+    let apiToken = config.apiToken || env.NEURALWATT_API_TOKEN;
+    if (!apiToken) {
+      throw new Error(
+          "Neuralwatt models require a Neuralwatt API key. Set the NEURALWATT_API_TOKEN secret on " +
+          "this Worker, or re-add the model with your own key.");
+    }
+    return getModelDirect({ ...config, apiToken }, options.sessionAffinity);
   }
 
   return getModelDirect(config, options.sessionAffinity);

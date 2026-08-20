@@ -15,6 +15,10 @@ const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 /**
  * Providers AI Gateway serves: the ones gatewayNativeModel() in ai-models.ts has a route for.
  * Ollama has none, so a model added under it could never run.
+ *
+ * Neuralwatt has a route but is left out: it reaches the gateway as a custom provider, which only
+ * works once that gateway has the registration (see gatewayNativeModel), so only the environment
+ * (CF_AI_GATEWAY_PROVIDERS) may enable it -- an admin cannot add models or turn it on here.
  */
 const GATEWAY_PROVIDERS: ReadonlySet<string> =
     new Set<AiModelProvider>(["anthropic", "openai", "google", "cloudflare"]);
@@ -135,16 +139,6 @@ export class AiGatewayConfig {
           `${names} inference cannot ride the Workers AI binding transport, so enabling the ` +
           `${names} provider${httpsOnly.length > 1 ? "s" : ""} requires ` +
           "CF_AI_GATEWAY_API_TOKEN.");
-    }
-    // Neuralwatt rides this provider list so its models are advertised alongside the gateway's,
-    // but it is reached directly rather than through the Gateway (see ai-models.ts getModel), so
-    // the Gateway's server-managed keys never apply to it. Fail at construction rather than
-    // letting every neuralwatt request die individually at stream time.
-    if (this.providers.has("neuralwatt") && !env.NEURALWATT_API_TOKEN) {
-      throw new Error(
-          "NEURALWATT_API_TOKEN is required when \"neuralwatt\" is listed in " +
-          "CF_AI_GATEWAY_PROVIDERS. Neuralwatt has no AI Gateway provider, so it is called " +
-          "directly and cannot use the Gateway's stored keys.");
     }
   }
 

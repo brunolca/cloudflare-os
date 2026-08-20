@@ -1540,8 +1540,10 @@ export type CloudflareAccountOption = {
  * Supported AI providers.
  *
  * "neuralwatt" is an OpenAI-compatible provider (https://api.neuralwatt.com/v1) that bills by
- * energy rather than tokens. Cloudflare AI Gateway has no neuralwatt provider, so unlike the
- * others it is never gateway-routed -- see the short-circuit in ai-models.ts getModel().
+ * energy rather than tokens. AI Gateway has no built-in neuralwatt provider, so it is reached
+ * through a *custom provider* registered on the platform gateway instead -- which, unlike the
+ * built-in ones, only that gateway has, so it is never billed to a connected user's own account.
+ * See gatewayNativeModel() and getModel() in ai-models.ts.
  */
 export type AiModelProvider =
     "neuralwatt" | "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
@@ -2030,6 +2032,12 @@ export function modelKind(provider: string, model: string): ModelKind {
  * pi's Vertex adapter throws the same way, so a google-vertex provider would belong here too; it
  * is absent only because this deployment has no such provider.
  * https://github.com/earendil-works/pi/blob/v0.84.2/packages/ai/src/api/google-vertex.ts#L98
+ *
+ * Neuralwatt is deliberately NOT here: it rides the binding like the natively-supported providers,
+ * even though it reaches the Gateway as a custom provider over /compat rather than over a
+ * per-provider native path. Nothing about the binding channel is provider-specific -- it carries
+ * whatever gateway path the model's baseUrl names -- so the custom-provider route needs no token
+ * of its own.
  */
 export const HTTPS_ONLY_PROVIDERS: ReadonlySet<string> = new Set<AiModelProvider>(["google"]);
 
