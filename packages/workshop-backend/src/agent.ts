@@ -15,6 +15,9 @@ import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
 import { webFetch as webFetchImpl, WebFetchEnv, formatWebFetchResult } from "./web-fetch";
 import { AgentCatalogSnapshot, formatAlwaysAvailableResourcesPrompt } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
+import {
+  attributeChatMessage, formatChatIdentityPrompt, listChatParticipants,
+} from "./chat-identity";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
@@ -1423,6 +1426,13 @@ export async function runAgent(
   // callback holds) -- keep them in sync.
   let callbackNameCounter = 0;
 
+  // Who has written in this chat (see chat-identity.ts). With more than one participant, replay
+  // names the author of each of their messages below, and the system prompt says that it does.
+  // A second participant arriving invalidates the prompt cache once, since it retroactively
+  // attributes the messages already in the log -- worth it to keep the identities straight.
+  let participants = listChatParticipants(chatMessages);
+  let attributeAuthors = participants.length > 1;
+
   // Rebuild the code the compacted prefix left behind. Accepted and proposed updates are stored
   // separately so a later revert can drop only the proposed ones, but replay needs both.
   if (checkpoint?.acceptedChanges) applyReplayedChanges(checkpoint.acceptedChanges, false);
@@ -1492,6 +1502,10 @@ export async function runAgent(
         switch (msg.author.type) {
           case "user":
           case "gadget":
+            // Name the author when the chat has several participants, so a request stays attached
+            // to whoever made it -- otherwise the model reads the one identity in the system prompt
+            // (the current sender) as the author of everything before it too.
+            if (attributeAuthors) content = attributeChatMessage(content, msg.author);
             if (msg.attachments?.length) {
               let parts: (TextContent | ImageContent)[] = [];
               if (content) parts.push({type: "text", text: content});
@@ -2241,6 +2255,15 @@ export async function runAgent(
           `${systemPromptWorkspace}${systemPromptConnections}` +
           (alwaysAvailableResourcesPrompt ? `\n\n${alwaysAvailableResourcesPrompt}` : ""),
     ];
+  }
+
+  // Name the person (or Gadget) driving this turn. Appended to the dynamic slot, and last within
+  // it: it is the most volatile part of the prompt, since in a shared chat it follows whoever wrote
+  // the message being answered.
+  let identityPrompt = formatChatIdentityPrompt(
+      initiator, attributeAuthors ? participants : undefined);
+  if (identityPrompt) {
+    systemPromptSlots[1] = `${systemPromptSlots[1]}\n\n${identityPrompt}`;
   }
 
   let systemPrompt = `${systemPromptSlots[0]}\n\n${systemPromptSlots[1]}`;
