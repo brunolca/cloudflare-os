@@ -23,9 +23,11 @@ function participantKey(author: AiChatAuthorInfo): string {
   return `${author.type}:${author.id}`;
 }
 
-// The distinct non-agent authors who have written in the chat, in first-appearance order. Note this
-// sees only the messages replay was given: after compaction the earlier participants live on in the
-// summary, not here, so a chat can drop back to a single participant.
+/**
+ * The distinct non-agent authors who have written in the chat, in first-appearance order. Note this
+ * sees only the messages replay was given: after compaction the earlier participants live on in the
+ * summary, not here, so a chat can drop back to a single participant.
+ */
 export function listChatParticipants(chatMessages: AiChatMessage[]): AiChatAuthorInfo[] {
   let participants = new Map<string, AiChatAuthorInfo>();
   for (let msg of chatMessages) {
@@ -36,23 +38,27 @@ export function listChatParticipants(chatMessages: AiChatMessage[]): AiChatAutho
   return [...participants.values()];
 }
 
-// Name the author of one message, for chats with more than one participant. Bracketed rather than
-// "Name: text" so it stays distinguishable from a message that happens to open with a colon.
-//
-// The prefix must be non-empty even for empty text: an image-only message still needs its author,
-// and the caller relies on the result being truthy to decide whether to emit a text part at all.
+/**
+ * Name the author of one message, for chats with more than one participant. Bracketed rather than
+ * "Name: text" so it stays distinguishable from a message that happens to open with a colon.
+ *
+ * The prefix must be non-empty even for empty text: an image-only message still needs its author,
+ * and the caller relies on the result being truthy to decide whether to emit a text part at all.
+ */
 export function attributeChatMessage(text: string, author: AiChatAuthorInfo): string {
   return text ? `[${author.name}] ${text}` : `[${author.name}]`;
 }
 
-// The system-prompt section naming who the agent is talking to.
-//
-// `attributedParticipants` is the chat's participant list when replay is prefixing messages with
-// their author (i.e. when there is more than one), and undefined when it isn't -- the prompt has to
-// describe the format the model is actually seeing, or the brackets read as part of the user's text.
-//
-// This belongs in the dynamic system-prompt slot: in a shared chat the initiator changes from turn
-// to turn as different collaborators write.
+/**
+ * The system-prompt section naming who the agent is talking to.
+ *
+ * `attributedParticipants` is the chat's participant list when replay is prefixing messages with
+ * their author (i.e. when there is more than one), and undefined when it isn't -- the prompt has to
+ * describe the format the model is actually seeing, or the brackets read as part of the user's text.
+ *
+ * This belongs in the dynamic system-prompt slot: in a shared chat the initiator changes from turn
+ * to turn as different collaborators write.
+ */
 export function formatChatIdentityPrompt(
     initiator: AiChatAuthorInfo,
     attributedParticipants?: AiChatAuthorInfo[]): string {

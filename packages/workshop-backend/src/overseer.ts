@@ -266,13 +266,15 @@ function isGadgetConnectNotImplemented(err: unknown): boolean {
       `The RPC receiver does not implement the method ${JSON.stringify(GADGET_CONNECT_METHOD)}.`;
 }
 
-// Offer `user`'s identity to the Gadget's optional onConnect() method, returning the per-connection
-// capability it hands back, or null to fall through to the bare facet.
-//
-// Null means the Gadget opted out, in one of two ways: it defines no onConnect() at all (every
-// Gadget written before this existed), or its onConnect() recorded the identity and returned
-// nothing, keeping the main Durable Object as the client's stub. Anything else it throws propagates,
-// failing the connection -- see isGadgetConnectNotImplemented for why that matters.
+/**
+ * Offer `user`'s identity to the Gadget's optional onConnect() method, returning the per-connection
+ * capability it hands back, or null to fall through to the bare facet.
+ *
+ * Null means the Gadget opted out, in one of two ways: it defines no onConnect() at all (every
+ * Gadget written before this existed), or its onConnect() recorded the identity and returned
+ * nothing, keeping the main Durable Object as the client's stub. Anything else it throws propagates,
+ * failing the connection -- see isGadgetConnectNotImplemented for why that matters.
+ */
 export async function connectGadgetAs(facet: any, user: GadgetUser)
     : Promise<RpcStub<any> | null> {
   try {
