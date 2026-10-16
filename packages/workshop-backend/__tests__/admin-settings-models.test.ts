@@ -793,15 +793,17 @@ describe("AdminSettings gateway providers", () => {
   const OPENAI_OFF = { provider: "openai", needsApiToken: false };
   const OPENAI_ON = { ...OPENAI_OFF, enabledBy: "admin" };
   const GOOGLE_OFF = { provider: "google", needsApiToken: false };
+  // Cerebras leads the catalog, and the environment here doesn't list it.
+  const CEREBRAS_OFF = { provider: "cerebras", needsApiToken: false };
 
   it("turns a provider on and off, storing and mirroring each change", async () => {
     const { inDo, put, mirror } = adminSettings();
     expect(await providers(inDo)).toStrictEqual(
-        { stored: [], view: [...FLOOR, OPENAI_OFF, GOOGLE_OFF] });
+        { stored: [], view: [CEREBRAS_OFF, ...FLOOR, OPENAI_OFF, GOOGLE_OFF] });
 
     await inDo(admin => admin.setGatewayProviderEnabled("openai", true));
     expect(await providers(inDo)).toStrictEqual(
-        { stored: ["openai"], view: [...FLOOR, OPENAI_ON, GOOGLE_OFF] });
+        { stored: ["openai"], view: [CEREBRAS_OFF, ...FLOOR, OPENAI_ON, GOOGLE_OFF] });
     expect(put).toHaveBeenCalledTimes(1);
     expect(put.mock.calls[0]![0]).toBe(".adminConfig");
     expect(JSON.parse(mirror.current!).addedProviders).toStrictEqual(["openai"]);
@@ -818,7 +820,7 @@ describe("AdminSettings gateway providers", () => {
 
     await inDo(admin => admin.setGatewayProviderEnabled("openai", false));
     expect(await providers(inDo)).toStrictEqual(
-        { stored: [], view: [...FLOOR, OPENAI_OFF, GOOGLE_OFF] });
+        { stored: [], view: [CEREBRAS_OFF, ...FLOOR, OPENAI_OFF, GOOGLE_OFF] });
     expect(JSON.parse(mirror.current!).addedProviders).toStrictEqual([]);
     const off = (await inDo(admin => admin.getSettings("admin"))).gatewayModels!;
     expect(off.providers).toEqual(["cloudflare", "anthropic"]);
@@ -838,7 +840,7 @@ describe("AdminSettings gateway providers", () => {
     await expect(inDo(admin => admin.setGatewayProviderEnabled("anthropic", false)))
         .rejects.toThrow(new Error('Provider "anthropic" is enabled by CF_AI_GATEWAY_PROVIDERS ' +
             "and can only be turned off there."));
-    expect((await providers(inDo)).view.slice(0, 2)).toStrictEqual(FLOOR);
+    expect((await providers(inDo)).view.slice(1, 3)).toStrictEqual(FLOOR);
     expect(put).not.toHaveBeenCalled();
 
     // Nor one that an admin had also turned on before the environment listed it.
@@ -853,7 +855,7 @@ describe("AdminSettings gateway providers", () => {
     await inDo(admin => admin.setGatewayProviderEnabled("anthropic", true));
     const { stored, view } = await providers(inDo);
     expect(stored).toStrictEqual([]);
-    expect(view.slice(0, 2)).toStrictEqual(FLOOR);
+    expect(view.slice(1, 3)).toStrictEqual(FLOOR);
   });
 
   it("refuses a provider AI Gateway does not serve, on or off", async () => {
@@ -910,7 +912,7 @@ describe("AdminSettings gateway providers", () => {
       await inDo(admin => admin.setGatewayProviderEnabled("google", true));
       const { gatewayModels } = await inDo(admin => admin.getSettings("admin"));
       expect(gatewayModels!.providerSettings).toStrictEqual([
-        ...FLOOR, OPENAI_OFF, { provider: "google", enabledBy: "admin", needsApiToken: true },
+        CEREBRAS_OFF, ...FLOOR, OPENAI_OFF, { provider: "google", enabledBy: "admin", needsApiToken: true },
       ]);
       expect(gatewayModels!.models.map(model => model.id)).toContain("gemini-3.6-flash");
 
@@ -1158,7 +1160,7 @@ describe("AdminSettings.testGatewayProvider", () => {
     expect((await test("cloudflare")).result).toStrictEqual({ model: KIMI, ok: true });
     const { stored, view } = await providers(inDo);
     expect(stored).toStrictEqual([]);
-    expect(view[0]).toStrictEqual({ provider: "cloudflare", needsApiToken: false });
+    expect(view[1]).toStrictEqual({ provider: "cloudflare", needsApiToken: false });
   });
 
   it("throws for a provider AI Gateway does not serve", async () => {
