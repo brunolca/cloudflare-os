@@ -729,7 +729,7 @@ describe("GatewayModels", () => {
       addedModels: [{ provider: "neuralwatt", id: "test-model", name: "Test", contextWindow: 1000 }],
     }, "neuralwatt");
     expect(models.get("test-model")).toBeUndefined();
-    expect(models.get("kimi-k2.7-code")?.provider).toBe("neuralwatt");
+    expect(models.get("mimo-v2.6-pro")?.provider).toBe("neuralwatt");
     expect(models.addableProviders).toEqual([]);
     expect(() => models.assertAddable(
         { provider: "neuralwatt", id: "test-model", name: "Test", contextWindow: 1000 }))

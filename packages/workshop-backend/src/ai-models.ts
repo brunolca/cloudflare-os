@@ -255,9 +255,9 @@ function workersAiCompat(catalog: CatalogEntry | undefined): OpenAICompletionsCo
 // declares `developer_role: false` / `system_role: true` for every model. The other two suppress
 // request fields the endpoint silently ignores, so pi doesn't advertise caching it won't get.
 //
-// Deliberately left at pi's defaults: `reasoning_effort` is accepted by every model (the catalog
-// marks it unsupported on kimi-k2.7-code, which ignores it rather than failing), and tool-result
-// replay was verified to work with reasoning blocks, tool_calls, and no `name` field.
+// Deliberately left at pi's defaults: `reasoning_effort` is accepted by every model the catalog
+// lists, and tool-result replay was verified to work with reasoning blocks, tool_calls, and no
+// `name` field.
 function neuralwattCompat(): OpenAICompletionsCompat {
   return {
     supportsStore: false,

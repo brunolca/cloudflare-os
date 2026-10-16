@@ -17,7 +17,7 @@ const INITIATOR: AiChatAuthorInfo = { type: "user", id: "user-123", name: "User"
 
 const NEURALWATT_CONFIG: AiModelConfig = {
   provider: "neuralwatt",
-  model: "kimi-k2.7-code",
+  model: "mimo-v2.6-pro",
   apiToken: "",
 };
 
@@ -81,8 +81,8 @@ describe("neuralwatt routing", () => {
     expect(handle.model.baseUrl).toBe(GATEWAY_COMPAT_URL);
     // The custom provider is named in the model field, which is what pi puts on the wire; the
     // display name stays bare so the UI still shows the plain model id.
-    expect(handle.model.id).toBe("custom-neuralwatt/kimi-k2.7-code");
-    expect(handle.model.name).toBe("kimi-k2.7-code");
+    expect(handle.model.id).toBe("custom-neuralwatt/mimo-v2.6-pro");
+    expect(handle.model.name).toBe("mimo-v2.6-pro");
     // A gateway request means a gateway log, hence a cost route to record against.
     expect(handle.aiGatewayLogRoute).toEqual({
       gateway: "cloudflare-os",
@@ -92,7 +92,7 @@ describe("neuralwatt routing", () => {
 
     const request = await captureRequest(handle);
     expect(request.url).toBe(`${GATEWAY_COMPAT_URL}/chat/completions`);
-    expect(JSON.parse(request.body).model).toBe("custom-neuralwatt/kimi-k2.7-code");
+    expect(JSON.parse(request.body).model).toBe("custom-neuralwatt/mimo-v2.6-pro");
     // The Neuralwatt key is stored on the custom provider in the Gateway, so the request carries
     // gateway auth only -- a provider Authorization header would take precedence over the
     // stored key and defeat the point.
@@ -143,14 +143,14 @@ describe("neuralwatt routing", () => {
 
     expect(handle.model.baseUrl)
         .toBe("https://workers-binding.ai/ai-gateway/gateways/cloudflare-os/compat");
-    expect(handle.model.id).toBe("custom-neuralwatt/kimi-k2.7-code");
+    expect(handle.model.id).toBe("custom-neuralwatt/mimo-v2.6-pro");
     // Same-account log reads need no account id or token over the binding.
     expect(handle.aiGatewayLogRoute).toEqual({ gateway: "cloudflare-os" });
 
     const request = await captureRequest(handle);
     expect(request.url)
         .toBe("https://workers-binding.ai/ai-gateway/gateways/cloudflare-os/compat/chat/completions");
-    expect(JSON.parse(request.body).model).toBe("custom-neuralwatt/kimi-k2.7-code");
+    expect(JSON.parse(request.body).model).toBe("custom-neuralwatt/mimo-v2.6-pro");
     // The sentinel satisfies pi's "some auth must be present" check; the Gateway recognizes and
     // strips it rather than forwarding it as a provider key, so the stored key still applies.
     expect(request.headers.get("cf-aig-authorization")).toBe("Bearer cloudflare-gateway-binding");
@@ -186,7 +186,8 @@ describe("neuralwatt routing", () => {
 
   it("uses the token-window metadata from SUGGESTED_MODELS", () => {
     const handle = getModel(env(), NEURALWATT_CONFIG, INITIATOR, {});
-    expect(handle.model.contextWindow).toBe(262128);
+    expect(handle.model.contextWindow).toBe(1048560);
+    expect(handle.model.maxTokens).toBe(393216);
     // Energy-billed, so a per-token cost would be fiction -- including through the Gateway, whose
     // log cost for an unpriced custom provider falls back to this estimate.
     expect(handle.model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
@@ -202,7 +203,7 @@ describe("neuralwatt without an AI Gateway", () => {
     const handle = getModel(directEnv(), NEURALWATT_CONFIG, INITIATOR, {});
 
     expect(handle.model.baseUrl).toBe("https://api.neuralwatt.com/v1");
-    expect(handle.model.id).toBe("kimi-k2.7-code");
+    expect(handle.model.id).toBe("mimo-v2.6-pro");
     // No Gateway request means no Gateway log, so there is no cost route to record against.
     expect(handle.aiGatewayLogRoute).toBeUndefined();
 
@@ -259,9 +260,9 @@ describe("AiGatewayConfig with neuralwatt enabled", () => {
     const models = new GatewayModels(config, DEFAULT_ADMIN_CONFIG);
     const ids = models.list("language").map(model => model.id);
 
-    expect(ids[0]).toBe("kimi-k2.7-code");
+    expect(ids[0]).toBe("mimo-v2.6-pro");
     expect(ids).toContain("claude-opus-5-5");
-    expect(models.get("glm-5.2")?.provider).toBe("neuralwatt");
+    expect(models.get("glm-5.3")?.provider).toBe("neuralwatt");
   });
 
   it("falls back to a Neuralwatt quick model when Workers AI is not enabled", () => {

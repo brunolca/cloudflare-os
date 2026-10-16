@@ -1923,13 +1923,26 @@ const SUGGESTED_MODEL_CATALOG = {
   // the head of that list -- so whichever provider leads this object is the deployment default.
   //
   // Context windows are the exact `max_model_len` values advertised by https://api.neuralwatt.com/v1
-  // /models; `outputLimit` is set only where that catalog declares a max_output_tokens.
+  // /models; `outputLimit` is set only where that catalog declares a max_output_tokens. Only the
+  // standard tier is listed: the catalog's `-flex`, `-fast` and `-speed` variants and its `nw-*`
+  // tracking aliases are the same models at another latency, reasoning default or name. Its
+  // gemma-4-31b is left to Cerebras, since a gateway model is looked up by ID alone.
   "neuralwatt": {
-    "kimi-k2.7-code": {name: "Kimi K2.7 Code (Neuralwatt)", contextWindow: 262128},
-    "glm-5.2": {name: "GLM 5.2 (Neuralwatt)", contextWindow: 1048560},
+    "mimo-v2.6-pro": {
+      name: "MiMo V2.6 Pro (Neuralwatt)", contextWindow: 1048560, outputLimit: 393216,
+    },
     "kimi-k3": {name: "Kimi K3 (Neuralwatt)", contextWindow: 1048560},
+    "glm-5.3": {name: "GLM 5.3 (Neuralwatt)", contextWindow: 1048560},
+    "qwen-3.8-27b": {
+      name: "Qwen 3.8 27B (Neuralwatt)", contextWindow: 262128, outputLimit: 131072,
+    },
+    "qwen3.6-35b": {name: "Qwen 3.6 35B (Neuralwatt)", contextWindow: 262128},
+    "glm-5.3-flash": {name: "GLM 5.3 Flash (Neuralwatt)", contextWindow: 1048560},
+    "deepseek-v4.1-flash": {
+      name: "DeepSeek V4.1 Flash (Neuralwatt)", contextWindow: 1048560, outputLimit: 393216,
+    },
     "deepseek-v4-flash": {
-      name: "DeepSeek V4 Flash (Neuralwatt)", contextWindow: 1048560, outputLimit: 65536,
+      name: "DeepSeek V4 Flash (Neuralwatt)", contextWindow: 1048560, outputLimit: 393216,
     },
   },
   // A built-in AI Gateway provider, reached over its native OpenAI-compatible path. Window and
